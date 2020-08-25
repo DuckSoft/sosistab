@@ -4,10 +4,18 @@ version = "0.1.0"
 authors = ["nullchinchilla <nullchinchilla@pm.me>"]
 edition = "2018"
 
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 smol="0.3"
+async-rwlock="1"
+async-executor="0.1"
 ed25519-dalek={version="1.0.0-pre.4", features=["serde"]}
 x25519-dalek={version="0.6", features=["serde"]}
 serde={version="1", features=["derive"]}
@@ -22,10 +30,18 @@ async-channel="1.2"
 raptorq="1.4.2"
 probability="0.17"
 log="0.4"
+async-lock="1"
 async-mutex="1.1"
 snap="1"
+async-dup="1"
+lazy_static = "1.4.0"
+num_cpus="1"
+anyhow="1"
+dashmap = "3.11.7"
+scopeguard="1"
 
 [dev-dependencies]
 chacha20poly1305={version="0.5", features=["reduced-round"]}
 aes-gcm="0.6"
 env_logger="0.7"
+hex="0.4"

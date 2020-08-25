@@ -4,6 +4,10 @@ use c2_chacha::ChaCha12;
 use rand::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::time::SystemTime;
+
+pub const UP_KEY: &[u8; 32] = b"upload--------------------------";
+pub const DN_KEY: &[u8; 32] = b"download------------------------";
 /// A structure for encrypting or decrypting Chacha12/Blake3-64.
 pub struct StdAEAD {
     chacha_key: [u8; 32],
@@ -70,9 +74,10 @@ impl StdAEAD {
     }
 
     /// Pad and encrypt.
-    pub fn pad_encrypt(&self, msg: &impl Serialize, target_len: usize) -> Bytes {
+    pub fn pad_encrypt(&self, msg: impl Serialize, target_len: usize) -> Bytes {
+        let target_len = rand::thread_rng().gen_range(0, target_len + 1);
         let mut plain = Vec::with_capacity(1500);
-        bincode::serialize_into(&mut plain, msg).unwrap();
+        bincode::serialize_into(&mut plain, &msg).unwrap();
         if plain.len() < target_len {
             plain.extend_from_slice(&vec![0; target_len - plain.len()]);
         }
@@ -142,4 +147,68 @@ mod tests {
             std::hint::black_box(aead.encrypt(nonce, ptext));
         })
     }
+}
+
+/// Cookie is a generator of temporary symmetric keys.
+pub struct Cookie(x25519_dalek::PublicKey);
+
+impl Cookie {
+    /// Create a new cookie based on a public key.
+    pub fn new(pk: x25519_dalek::PublicKey) -> Cookie {
+        Cookie(pk)
+    }
+
+    fn generate_temp_keys(&self, ctx: &str, start_epoch: u64) -> Vec<[u8; 32]> {
+        let mut vec = Vec::new();
+        for epoch in &[start_epoch, start_epoch - 1, start_epoch + 1] {
+            let mut key = [0u8; 32];
+            blake3::derive_key(&format!("{}-{}", ctx, epoch), self.0.as_bytes(), &mut key);
+            vec.push(key)
+        }
+        vec
+    }
+
+    /// Generate a bunch of symmetric keys given the current time, for client to server.
+    pub fn generate_c2s(&self) -> impl Iterator<Item = [u8; 32]> {
+        self.generate_temp_keys("sosistab-1-c2s", curr_epoch())
+            .into_iter()
+    }
+
+    /// Generate a bunch of symmetric keys given the current time, for server to client.
+    pub fn generate_s2c(&self) -> impl Iterator<Item = [u8; 32]> {
+        self.generate_temp_keys("sosistab-1-s2c", curr_epoch())
+            .into_iter()
+    }
+}
+
+fn curr_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("must be after Unix epoch")
+        .as_secs()
+        / 60
+}
+
+pub fn triple_ecdh(
+    my_long_sk: &x25519_dalek::StaticSecret,
+    my_eph_sk: &x25519_dalek::StaticSecret,
+    their_long_pk: &x25519_dalek::PublicKey,
+    their_eph_pk: &x25519_dalek::PublicKey,
+) -> blake3::Hash {
+    let g_e_a = my_eph_sk.diffie_hellman(&their_long_pk);
+    let g_a_e = my_long_sk.diffie_hellman(&their_eph_pk);
+    let g_e_e = my_eph_sk.diffie_hellman(&their_eph_pk);
+    let to_hash = {
+        let mut to_hash = Vec::new();
+        if g_e_a.as_bytes() < g_a_e.as_bytes() {
+            to_hash.extend_from_slice(g_e_a.as_bytes());
+            to_hash.extend_from_slice(g_a_e.as_bytes());
+        } else {
+            to_hash.extend_from_slice(g_a_e.as_bytes());
+            to_hash.extend_from_slice(g_e_a.as_bytes());
+        }
+        to_hash.extend_from_slice(g_e_e.as_bytes());
+        to_hash
+    };
+    blake3::hash(&to_hash)
 }

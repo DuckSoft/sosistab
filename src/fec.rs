@@ -31,6 +31,12 @@ impl FrameEncoder {
         // first we join the packets into the scratch space
         self.scratch_space.clear();
         pre_encode(pkts, &mut self.scratch_space);
+        log::trace!(
+            "encoding {} pkts (preencoded {}B) with measured loss {}",
+            pkts.len(),
+            self.scratch_space.len(),
+            measured_loss
+        );
         // then we encode it
         let rq_encoder = Encoder::with_defaults(&self.scratch_space, 1300);
         let mut out = Vec::new();
@@ -57,9 +63,6 @@ impl FrameEncoder {
 
     /// Calculates the number of repair blocks needed to properly reconstruct a run of packets.
     fn repair_len(&mut self, measured_loss: u8, run_len: usize) -> usize {
-        if measured_loss <= self.target_loss {
-            return 0;
-        }
         let target_loss = self.target_loss;
         *self
             .rate_table
@@ -68,11 +71,11 @@ impl FrameEncoder {
                 for additional_len in 0.. {
                     let distro = probability::distribution::Binomial::with_failure(
                         run_len + additional_len,
-                        measured_loss as f64 / 256.0,
+                        (measured_loss as f64 / 256.0).max(1e-100).min(1.0 - 1e-100),
                     );
                     let result_loss = distro.distribution(run_len as f64);
                     if result_loss <= target_loss as f64 / 256.0 {
-                        return additional_len;
+                        return additional_len.saturating_sub(1usize);
                     }
                 }
                 panic!()
