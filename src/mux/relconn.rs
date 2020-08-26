@@ -4,8 +4,12 @@ use bytes::Bytes;
 use mux::structs::{Message, RelKind, Reorderer, Seqno};
 use smol::io::{AsyncRead, AsyncWrite};
 use smol::{future::Boxed, prelude::*};
+use std::collections::{BinaryHeap, VecDeque};
 use std::future::Future;
-use std::time::{Duration, Instant};
+use std::{
+    cmp::Reverse,
+    time::{Duration, Instant},
+};
 
 const MSS: usize = 1024;
 const MAX_WAIT_SECS: u64 = 60;
@@ -42,7 +46,7 @@ impl RelConn {
     pub(crate) fn new(state: RelConnState, output: Sender<Message>) -> (Self, RelConnBack) {
         let (send_write, recv_write) = async_channel::bounded(100);
         let (send_read, recv_read) = async_channel::bounded(100);
-        let (send_wire_read, recv_wire_read) = async_channel::bounded(10000);
+        let (send_wire_read, recv_wire_read) = async_channel::unbounded();
         runtime::spawn(relconn_actor(
             state,
             recv_write,
@@ -79,17 +83,22 @@ impl RelConn {
 }
 
 pub(crate) enum RelConnState {
-    SynReceived { stream_id: u16 },
-    SynSent { stream_id: u16, tries: usize },
-    SteadyState { stream_id: u16, conn_vars: ConnVars },
-    Reset { stream_id: u16, death: smol::Timer },
+    SynReceived {
+        stream_id: u16,
+    },
+    SynSent {
+        stream_id: u16,
+        tries: usize,
+    },
+    SteadyState {
+        stream_id: u16,
+        conn_vars: Box<ConnVars>,
+    },
+    Reset {
+        stream_id: u16,
+        death: smol::Timer,
+    },
 }
-use std::{
-    collections::VecDeque,
-    num::{NonZeroUsize, Wrapping},
-    pin::Pin,
-    task::{Context, Poll},
-};
 use RelConnState::*;
 
 async fn unwrap_or_sleep<T>(val: Option<T>) -> T {
@@ -109,7 +118,7 @@ async fn relconn_actor(
     // match on our current state repeatedly
     #[derive(Debug, Clone)]
     enum Evt {
-        Rto,
+        Rto(Seqno),
         DelayedAck,
         NewWrite(Bytes),
         NewPkt(Message),
@@ -135,7 +144,7 @@ async fn relconn_actor(
                 .await;
                 SteadyState {
                     stream_id,
-                    conn_vars: ConnVars::default(),
+                    conn_vars: Box::new(ConnVars::default()),
                 }
             }
             SynSent { stream_id, tries } => {
@@ -162,7 +171,7 @@ async fn relconn_actor(
                     log::trace!("C={} SynSent got SYN-ACK", stream_id);
                     SteadyState {
                         stream_id,
-                        conn_vars: ConnVars::default(),
+                        conn_vars: Box::new(ConnVars::default()),
                     }
                 } else {
                     log::trace!("C={} SynSent timed out", stream_id);
@@ -178,16 +187,9 @@ async fn relconn_actor(
             } => {
                 let event = {
                     let writeable = conn_vars.inflight.len() <= conn_vars.cwnd as usize;
-                    let rto_timer = &mut conn_vars.rto_timer;
+                    let rto_timer = conn_vars.inflight.wait_first(conn_vars.rto_duration);
                     let delayed_ack_timer = &mut conn_vars.delayed_ack_timer;
-                    let rto_timeout = async {
-                        if let Some(rto) = rto_timer {
-                            rto.await;
-                            Ok::<Evt, anyhow::Error>(Evt::Rto)
-                        } else {
-                            Ok(smol::future::pending().await)
-                        }
-                    };
+                    let rto_timeout = async { Ok::<Evt, anyhow::Error>(Evt::Rto(rto_timer.await)) };
                     let ack_timeout = async {
                         if let Some(rto) = delayed_ack_timer {
                             rto.await;
@@ -210,17 +212,14 @@ async fn relconn_actor(
                     rto_timeout.or(ack_timeout).or(new_write).or(new_pkt).await
                 };
                 match event {
-                    Ok(Evt::Rto) => {
+                    Ok(Evt::Rto(seqno)) => {
                         // retransmit first unacknowledged packet
-                        assert!(!conn_vars.inflight.is_empty());
-                        conn_vars.congestion_rto();
-                        for (seqno, pkt) in conn_vars.inflight.iter().take(1) {
-                            transmit(pkt.clone()).await;
+                        // assert!(!conn_vars.inflight.len() == 0);
+                        eprintln!("retransmit {}", seqno);
+                        if conn_vars.inflight.len() > 0 {
+                            conn_vars.congestion_rto();
+                            transmit(conn_vars.inflight.get_seqno(seqno).unwrap().clone()).await;
                         }
-                        // reset RTO timer
-                        conn_vars.rto_duration += conn_vars.rto_duration / 3;
-                        log::trace!("RTO; duration now {}ms", conn_vars.rto_duration.as_millis());
-                        conn_vars.rto_timer = Some(smol::Timer::new(conn_vars.rto_duration));
                         // new state
                         SteadyState {
                             stream_id,
@@ -260,24 +259,14 @@ async fn relconn_actor(
                     })) => {
                         log::trace!("new data pkt with seqno={}, ack_seqno={}", seqno, ack_seqno);
                         // process ack
-                        while !conn_vars.inflight.is_empty() && conn_vars.inflight[0].0 < ack_seqno
-                        {
-                            log::trace!(
-                                "ack_seqno={} acknowledges {}",
-                                ack_seqno,
-                                conn_vars.inflight[0].0
-                            );
-                            conn_vars.inflight.pop_front();
-                            conn_vars.congestion_ack();
-                            conn_vars.rto_duration = Duration::from_secs(1);
+                        let acked = conn_vars.inflight.mark_acked_lt(ack_seqno);
+                        for _ in 0..acked {
+                            conn_vars.congestion_ack()
                         }
                         if conn_vars.delayed_ack_timer.is_none() {
                             log::trace!("scheduling delayed ACK");
                             conn_vars.delayed_ack_timer =
-                                Some(smol::Timer::new(Duration::from_millis(10)));
-                        }
-                        if conn_vars.inflight.is_empty() {
-                            conn_vars.rto_timer = None
+                                Some(smol::Timer::new(Duration::from_millis(1)));
                         }
                         if !payload.is_empty() {
                             if seqno >= conn_vars.lowest_unseen {
@@ -302,22 +291,22 @@ async fn relconn_actor(
                             }
                         }
                         // process dupack
-                        if conn_vars.dupack_seqno == ack_seqno {
-                            conn_vars.dupack_count += 1;
-                            if conn_vars.dupack_count >= DUPACK_THRESHOLD
-                                && !conn_vars.inflight.is_empty()
-                            {
-                                log::trace!("fast retransmit {}", ack_seqno);
-                                conn_vars.dupack_count = 0;
-                                conn_vars.congestion_fast();
-                                for (_, pkt) in conn_vars.inflight.iter().take(1) {
-                                    transmit(pkt.clone()).await;
-                                }
-                            }
-                        } else {
-                            conn_vars.dupack_count = 0;
-                            conn_vars.dupack_seqno = ack_seqno;
-                        }
+                        // if conn_vars.dupack_seqno == ack_seqno {
+                        //     conn_vars.dupack_count += 1;
+                        //     if conn_vars.dupack_count >= DUPACK_THRESHOLD
+                        //         && !conn_vars.inflight.len() == 0
+                        //     {
+                        //         log::trace!("fast retransmit {}", ack_seqno);
+                        //         conn_vars.dupack_count = 0;
+                        //         conn_vars.congestion_fast();
+                        //         for (_, pkt) in conn_vars.inflight.iter().take(1) {
+                        //             transmit(pkt.clone()).await;
+                        //         }
+                        //     }
+                        // } else {
+                        //     conn_vars.dupack_count = 0;
+                        //     conn_vars.dupack_seqno = ack_seqno;
+                        // }
                         SteadyState {
                             stream_id,
                             conn_vars,
@@ -334,9 +323,10 @@ async fn relconn_actor(
                             payload: b,
                         };
                         // put msg into inflight
-                        conn_vars.inflight.push_back((seqno, msg.clone()));
-                        conn_vars.rto_duration = Duration::from_secs(1);
-                        conn_vars.rto_timer = Some(smol::Timer::new(conn_vars.rto_duration));
+                        conn_vars
+                            .inflight
+                            .insert(seqno, Duration::from_millis(250), msg.clone());
+                        conn_vars.rto_duration = Duration::from_millis(250);
                         conn_vars.delayed_ack_timer = None;
 
                         transmit(msg).await;
@@ -402,9 +392,8 @@ impl RelConnBack {
 }
 
 pub(crate) struct ConnVars {
-    inflight: VecDeque<(Seqno, Message)>,
+    inflight: Inflight,
     next_free_seqno: u64,
-    rto_timer: Option<smol::Timer>,
     delayed_ack_timer: Option<smol::Timer>,
     rto_duration: Duration,
 
@@ -422,11 +411,10 @@ pub(crate) struct ConnVars {
 impl Default for ConnVars {
     fn default() -> Self {
         ConnVars {
-            inflight: VecDeque::new(),
+            inflight: Inflight::default(),
             next_free_seqno: 0,
-            rto_timer: None,
             delayed_ack_timer: None,
-            rto_duration: Duration::from_secs(1),
+            rto_duration: Duration::from_millis(250),
 
             reorderer: Reorderer::default(),
             lowest_unseen: 0,
@@ -443,14 +431,20 @@ impl Default for ConnVars {
 impl ConnVars {
     fn congestion_ack(&mut self) {
         self.cubic_update();
+        //self.cwnd += 1.0 / self.cwnd;
         eprintln!("ACK CWND => {}", self.cwnd);
     }
 
     fn congestion_rto(&mut self) {
-        self.cwnd_max = self.cwnd;
-        let now = self.cubic_update();
-        self.last_loss = now;
-        eprintln!("RTO CWND => {}", self.cwnd);
+        if Instant::now()
+            .saturating_duration_since(self.last_loss)
+            .as_millis()
+            > 1500
+        {
+            self.cwnd_max = self.cwnd;
+            let now = self.cubic_update();
+            self.last_loss = now
+        }
     }
 
     fn congestion_fast(&mut self) {
@@ -474,5 +468,79 @@ impl ConnVars {
         self.cwnd = wt.min(10000.0);
         //self.cwnd = 1500.0;
         now
+    }
+}
+
+#[derive(Default)]
+struct Inflight {
+    segments: VecDeque<(Seqno, bool, Message)>,
+    times: BinaryHeap<(Reverse<Instant>, Seqno)>,
+}
+
+impl Inflight {
+    fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    fn mark_acked(&mut self, seqno: Seqno) {
+        // mark the right one
+        if let Some((first_seqno, _, _)) = self.segments.front() {
+            let first_seqno = *first_seqno;
+            if seqno >= first_seqno {
+                let offset = (seqno - first_seqno) as usize;
+                if let Some((_, acked, _)) = self.segments.get_mut(offset) {
+                    *acked = true
+                }
+            }
+            // shrink if possible
+            while self.len() > 0 && self.segments.front().unwrap().1 {
+                self.segments.pop_front();
+            }
+        }
+    }
+
+    fn mark_acked_lt(&mut self, ack_seqno: Seqno) -> usize {
+        let mut to_mark = Vec::new();
+        for elem in self.segments.iter() {
+            if elem.0 < ack_seqno {
+                to_mark.push(elem.0);
+            }
+        }
+        let toret = to_mark.len();
+        for lala in to_mark {
+            self.mark_acked(lala);
+        }
+        toret
+    }
+
+    fn insert(&mut self, seqno: Seqno, rto: Duration, msg: Message) {
+        self.segments.push_back((seqno, false, msg));
+        self.times.push((Reverse(Instant::now() + rto), seqno));
+    }
+
+    fn get_seqno(&self, seqno: Seqno) -> Option<&Message> {
+        if let Some((first_seqno, _, _)) = self.segments.front() {
+            let first_seqno = *first_seqno;
+            if seqno >= first_seqno {
+                let offset = (seqno - first_seqno) as usize;
+                if let Some((_, false, msg)) = self.segments.get(offset) {
+                    return Some(msg);
+                }
+            }
+        }
+        None
+    }
+
+    async fn wait_first(&mut self, rto: Duration) -> Seqno {
+        while !self.times.is_empty() {
+            let (time, _) = self.times.peek().unwrap();
+            smol::Timer::new(time.0.saturating_duration_since(Instant::now())).await;
+            let (time, seqno) = self.times.pop().unwrap();
+            if self.get_seqno(seqno).is_some() {
+                self.times.push((Reverse(time.0 + rto), seqno));
+                return seqno;
+            }
+        }
+        smol::future::pending().await
     }
 }

@@ -16,7 +16,7 @@ pub async fn multiplex(
     conn_accept_send: Sender<RelConn>,
 ) -> anyhow::Result<()> {
     let conn_tab = RwLock::new(ConnTable::default());
-    let (glob_send, glob_recv) = async_channel::bounded(1000);
+    let (glob_send, glob_recv) = async_channel::bounded(1);
     loop {
         // fires on receiving messages
         let recv_evt = async {
