@@ -1,6 +1,7 @@
+use async_channel::Sender;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, num::Wrapping};
+use std::collections::BTreeMap;
 
 /// A sequence number.
 pub type Seqno = u64;
@@ -29,12 +30,12 @@ pub enum RelKind {
 }
 
 #[derive(Clone)]
-pub struct Reorderer<T> {
+pub struct Reorderer<T: Clone> {
     pkts: BTreeMap<Seqno, T>,
     min: Seqno,
 }
 
-impl<T> Default for Reorderer<T> {
+impl<T: Clone> Default for Reorderer<T> {
     fn default() -> Self {
         Reorderer {
             pkts: BTreeMap::new(),
@@ -43,22 +44,31 @@ impl<T> Default for Reorderer<T> {
     }
 }
 
-impl<T> Reorderer<T> {
-    pub fn insert(&mut self, seq: Seqno, item: T) {
+impl<T: Clone> Reorderer<T> {
+    pub fn insert(&mut self, seq: Seqno, item: T) -> bool {
         if seq >= self.min && seq <= self.min + 10000 {
             self.pkts.insert(seq, item);
+            true
+        } else {
+            eprintln!("discarding {} (min={})", seq, self.min);
+            false
         }
     }
-    pub fn take(&mut self) -> Vec<T> {
-        let mut output = Vec::with_capacity(self.pkts.len());
+    pub fn take(&mut self, output: &Sender<T>) -> u64 {
+        let mut times = 0;
         for idx in self.min.. {
-            if let Some(item) = self.pkts.remove(&idx) {
-                output.push(item);
+            if let Some(item) = self.pkts.get(&idx) {
+                if output.try_send(item.clone()).is_ok() {
+                    self.pkts.remove(&idx);
+                } else {
+                    break;
+                }
                 self.min = idx + 1;
+                times += 1;
             } else {
                 break;
             }
         }
-        output
+        times
     }
 }

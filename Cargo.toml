@@ -40,9 +40,12 @@ anyhow="1"
 futures="0.3"
 dashmap = "3.11.7"
 scopeguard="1"
+
 [dev-dependencies]
 chacha20poly1305={version="0.5", features=["reduced-round"]}
 aes-gcm="0.6"
 env_logger="0.7"
 hex="0.4"
 socksv5="0.2"
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+jemallocator = "0.3.2"

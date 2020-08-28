@@ -1,8 +1,5 @@
 use async_channel::{Receiver, Sender};
 use bytes::Bytes;
-use futures::StreamExt;
-use smol::future::Boxed;
-use smol::future::Future;
 use smol::prelude::*;
 use std::io::{Read, Write};
 use std::{
@@ -59,7 +56,7 @@ impl BytesWriter {
 
     pub fn new(inner: Sender<Bytes>) -> Self {
         BytesWriter {
-            wrapped: smol::Unblock::new(BytesWriterInner { chan: inner }),
+            wrapped: smol::Unblock::with_capacity(128 * 1024, BytesWriterInner { chan: inner }),
         }
     }
 }
@@ -70,7 +67,7 @@ impl AsyncWrite for BytesWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        self.project().poll_write(cx, buf) 
+        self.project().poll_write(cx, buf)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {

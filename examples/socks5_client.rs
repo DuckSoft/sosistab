@@ -5,6 +5,13 @@ use std::net::{TcpListener, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_env = "msvc"))]
+use jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 fn main() {
     env_logger::init();
     smol::block_on(async {
@@ -31,7 +38,7 @@ fn main() {
             smol::spawn(async move {
                 let remote = session.open_conn().await.unwrap();
                 drop(
-                    smol::future::zip(
+                    smol::future::race(
                         smol::io::copy(client.clone(), remote.to_async_writer()),
                         smol::io::copy(remote.to_async_reader(), client),
                     )

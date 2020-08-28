@@ -127,10 +127,10 @@ fn post_decode(raw: Bytes) -> Option<Vec<Bytes>> {
     if raw.len() < 2 {
         return None;
     }
-    let mut ptr = raw.clone();
+    let mut ptr = raw;
     while !ptr.is_empty() {
         let pkt_len = u16::from_le_bytes([ptr[0], ptr[1]]) as usize;
-        if raw.len() < pkt_len + 2 {
+        if ptr.len() < pkt_len + 2 {
             return None;
         }
         out.push(ptr.slice(2..2 + (pkt_len as usize)));

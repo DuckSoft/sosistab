@@ -16,7 +16,7 @@ pub async fn multiplex(
     conn_accept_send: Sender<RelConn>,
 ) -> anyhow::Result<()> {
     let conn_tab = RwLock::new(ConnTable::default());
-    let (glob_send, glob_recv) = async_channel::unbounded();
+    let (glob_send, glob_recv) = async_channel::bounded(1000);
     loop {
         // fires on receiving messages
         let recv_evt = async {
@@ -177,6 +177,11 @@ impl ConnTable {
         loop {
             let possible_id: u16 = rand::thread_rng().gen();
             if self.sid_to_stream.get(&possible_id).is_none() {
+                log::debug!(
+                    "found id {} out of {}",
+                    possible_id,
+                    self.sid_to_stream.len()
+                );
                 break Some(possible_id);
             }
         }

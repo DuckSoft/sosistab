@@ -3,14 +3,9 @@ use async_channel::{Receiver, Sender};
 use bytes::Bytes;
 use futures::prelude::*;
 use mux::structs::{Message, RelKind, Reorderer, Seqno};
-use smol::future::Boxed;
 use smol::prelude::*;
-use std::future::Future;
-use std::sync::{Arc, Mutex};
 use std::{
     collections::VecDeque,
-    pin::Pin,
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 mod asyncrw;
@@ -27,9 +22,9 @@ pub struct RelConn {
 
 impl RelConn {
     pub(crate) fn new(state: RelConnState, output: Sender<Message>) -> (Self, RelConnBack) {
-        let (send_write, recv_write) = async_channel::bounded(100);
+        let (send_write, recv_write) = async_channel::bounded(1);
         let (send_read, recv_read) = async_channel::bounded(1000);
-        let (send_wire_read, recv_wire_read) = async_channel::bounded(10000);
+        let (send_wire_read, recv_wire_read) = async_channel::bounded(1000);
         runtime::spawn(relconn_actor(
             state,
             recv_write,
@@ -98,13 +93,6 @@ use asyncrw::{BytesReader, BytesWriter};
 use inflight::Inflight;
 use RelConnState::*;
 
-async fn unwrap_or_sleep<T>(val: Option<T>) -> T {
-    match val {
-        Some(val) => val,
-        None => smol::future::pending::<T>().await,
-    }
-}
-
 async fn relconn_actor(
     mut state: RelConnState,
     recv_write: Receiver<Bytes>,
@@ -169,6 +157,13 @@ async fn relconn_actor(
                     }
                 } else {
                     log::trace!("C={} SynSent timed out", stream_id);
+                    transmit(Message::Rel {
+                        kind: RelKind::Syn,
+                        stream_id,
+                        seqno: 0,
+                        payload: Bytes::new(),
+                    })
+                    .await;
                     SynSent {
                         stream_id,
                         tries: tries + 1,
@@ -253,22 +248,9 @@ async fn relconn_actor(
                             stream_id,
                         })
                         .await;
-                        conn_vars.reorderer.insert(
-                            seqno,
-                            Message::Rel {
-                                kind: RelKind::Data,
-                                seqno,
-                                payload,
-                                stream_id,
-                            },
-                        );
-                        for out in conn_vars.reorderer.take() {
-                            if let Message::Rel { payload, seqno, .. } = out {
-                                log::trace!("taking seqno {}", seqno);
-                                drop(send_read.send(payload).await);
-                                conn_vars.lowest_unseen = seqno + 1;
-                            }
-                        }
+                        conn_vars.reorderer.insert(seqno, payload);
+                        let times = conn_vars.reorderer.take(&send_read);
+                        conn_vars.lowest_unseen += times;
 
                         // process dupack
                         // if conn_vars.dupack_seqno == ack_seqno {
@@ -367,17 +349,13 @@ impl RelConnBack {
     pub fn process(&self, input: Message) {
         drop(self.send_wire_read.try_send(input))
     }
-
-    pub fn close(&self) {
-        self.send_wire_read.close();
-    }
 }
 
 pub(crate) struct ConnVars {
     inflight: Inflight,
     next_free_seqno: u64,
 
-    reorderer: Reorderer<Message>,
+    reorderer: Reorderer<Bytes>,
     lowest_unseen: Seqno,
     // read_buffer: VecDeque<Bytes>,
     cwnd: f64,
@@ -422,10 +400,10 @@ impl ConnVars {
 
     fn cubic_update(&mut self) -> Instant {
         let now = Instant::now();
-        let t = now.saturating_duration_since(self.last_loss).as_secs_f64();
+        let t = now.saturating_duration_since(self.last_loss).as_secs_f64() * 4.0;
         let k = (self.cwnd_max / 2.0).powf(0.333);
         let wt = 0.4 * (t - k).powf(3.0) + self.cwnd_max;
-        let new_cwnd = wt.min(10000.0);
+        let new_cwnd = wt.min(1000.0);
         self.cwnd = new_cwnd;
         now
     }

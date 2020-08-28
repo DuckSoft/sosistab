@@ -5,6 +5,13 @@ use std::net::{
     Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream, ToSocketAddrs, UdpSocket,
 };
 
+#[cfg(not(target_env = "msvc"))]
+use jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 fn main() {
     env_logger::init();
     let socket = UdpSocket::bind("[::]:12345").unwrap();
@@ -39,9 +46,9 @@ fn main() {
 }
 
 async fn handle(mut conn: sosistab::mux::RelConn) -> anyhow::Result<()> {
-    let handshake = dbg!(read_handshake(conn.to_async_reader()).await?);
+    let handshake = read_handshake(conn.to_async_reader()).await?;
     write_auth_method(conn.to_async_writer(), SocksV5AuthMethod::Noauth).await?;
-    let request = dbg!(read_request(conn.to_async_reader()).await?);
+    let request = read_request(conn.to_async_reader()).await?;
     let port = request.port;
     let addr = match &request.host {
         SocksV5Host::Domain(dom) => {
@@ -65,9 +72,9 @@ async fn handle(mut conn: sosistab::mux::RelConn) -> anyhow::Result<()> {
     )
     .await?;
     let remote = async_dup::Arc::new(smol::Async::<TcpStream>::connect(addr).await?);
-    eprintln!("remote connected");
+    eprintln!("remote {} connected", addr);
     let upload = smol::io::copy(conn.to_async_reader(), remote.clone());
     let download = smol::io::copy(remote, conn.to_async_writer());
-    drop(smol::future::zip(upload, download).await);
+    drop(smol::future::race(upload, download).await);
     Ok(())
 }

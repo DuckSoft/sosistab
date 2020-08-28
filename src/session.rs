@@ -145,7 +145,7 @@ async fn session_loop(cfg: SessionConfig, recv_tosend: Receiver<Bytes>, send_inp
                 continue;
             }
             loss_calc.update_params(new_frame.high_recv_frame_no, new_frame.total_recv_frames);
-            measured_loss.store(loss_to_u8(loss_calc.median), Ordering::Relaxed);
+            measured_loss.store(loss_to_u8(loss_calc.median).min(128), Ordering::Relaxed);
             high_recv_frame_no.fetch_max(new_frame.frame_no, Ordering::Relaxed);
             total_recv_frames.fetch_add(1, Ordering::Relaxed);
             if new_frame.run_no > run_no || reconstruction_buffer.is_none() {
@@ -211,7 +211,6 @@ fn loss_to_u8(loss: f64) -> u8 {
 struct LossCalculator {
     last_top_seqno: u64,
     last_total_seqno: u64,
-    last_time: Instant,
     loss_samples: VecDeque<f64>,
     median: f64,
 }
@@ -221,7 +220,6 @@ impl LossCalculator {
         LossCalculator {
             last_top_seqno: 0,
             last_total_seqno: 0,
-            last_time: Instant::now(),
             loss_samples: VecDeque::new(),
             median: 0.0,
         }
@@ -235,7 +233,7 @@ impl LossCalculator {
             self.last_total_seqno = total_seqno;
             let loss_sample = 1.0 - delta_total / delta_top.max(delta_total);
             self.loss_samples.push_back(loss_sample);
-            if self.loss_samples.len() > 8 {
+            if self.loss_samples.len() > 32 {
                 self.loss_samples.pop_front();
             }
             let median = {
