@@ -16,7 +16,7 @@ pub async fn multiplex(
     conn_accept_send: Sender<RelConn>,
 ) -> anyhow::Result<()> {
     let conn_tab = RwLock::new(ConnTable::default());
-    let (glob_send, glob_recv) = async_channel::bounded(1);
+    let (glob_send, glob_recv) = async_channel::unbounded();
     loop {
         // fires on receiving messages
         let recv_evt = async {
@@ -44,7 +44,6 @@ pub async fn multiplex(
                                         kind: RelKind::Rst,
                                         stream_id,
                                         seqno: 0,
-                                        ack_seqno: 0,
                                         payload: Bytes::new(),
                                     })
                                     .unwrap()
@@ -69,9 +68,23 @@ pub async fn multiplex(
                         if let Some(handle) = conn_tab.read().await.get_stream(stream_id) {
                             log::trace!("handing over {:?} to {}", kind, stream_id);
                             handle.process(msg)
+                        } else {
+                            log::trace!("discarding {:?} to nonexistent {}", kind, stream_id);
+                            if kind != RelKind::Rst {
+                                session
+                                    .send_bytes(
+                                        bincode::serialize(&Message::Rel {
+                                            kind: RelKind::Rst,
+                                            stream_id,
+                                            seqno: 0,
+                                            payload: Bytes::new(),
+                                        })
+                                        .unwrap()
+                                        .into(),
+                                    )
+                                    .await;
+                            }
                         }
-
-                        log::trace!("discarding {:?} to nonexistent {}", kind, stream_id);
                     }
                 }
             }
@@ -126,7 +139,6 @@ pub async fn multiplex(
                     kind: RelKind::Syn,
                     stream_id,
                     seqno: 0,
-                    ack_seqno: 0,
                     payload: Bytes::new(),
                 })
                 .await?;

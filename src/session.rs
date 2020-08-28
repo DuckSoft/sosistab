@@ -80,19 +80,17 @@ async fn session_loop(cfg: SessionConfig, recv_tosend: Receiver<Bytes>, send_inp
                 // get as much tosend as possible within the timeout
                 // this lets us do raptorq at maximum efficiency
                 to_send.push(infal(recv_tosend.recv()).await);
-                let mut timeout = smol::Timer::new(cfg.latency);
+                let mut timeout = smol::Timer::after(cfg.latency);
                 loop {
-                    let res = smol::future::race(
-                        async {
-                            (&mut timeout).await;
-                            true
-                        },
-                        async {
-                            to_send.push(infal(recv_tosend.recv()).await);
-                            false
-                        },
-                    );
-                    if res.await {
+                    let res = async {
+                        (&mut timeout).await;
+                        true
+                    }
+                    .or(async {
+                        to_send.push(infal(recv_tosend.recv()).await);
+                        false
+                    });
+                    if res.await || to_send.len() > 16 {
                         break &to_send;
                     }
                 }
@@ -107,6 +105,13 @@ async fn session_loop(cfg: SessionConfig, recv_tosend: Receiver<Bytes>, send_inp
             //     encoded.len()
             // );
             for bts in encoded {
+                if frame_no % 1000 == 0 {
+                    log::debug!(
+                        "frame {}, measured loss {}",
+                        frame_no,
+                        measured_loss.load(Ordering::Relaxed)
+                    );
+                }
                 drop(
                     cfg.send_frame
                         .send(DataFrame {
@@ -230,8 +235,7 @@ impl LossCalculator {
             self.last_total_seqno = total_seqno;
             let loss_sample = 1.0 - delta_total / delta_top.max(delta_total);
             self.loss_samples.push_back(loss_sample);
-            log::trace!("recording loss sample {}", loss_sample);
-            if self.loss_samples.len() > 16 {
+            if self.loss_samples.len() > 8 {
                 self.loss_samples.pop_front();
             }
             let median = {

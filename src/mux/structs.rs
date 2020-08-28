@@ -13,12 +13,11 @@ pub enum Message {
         kind: RelKind,
         stream_id: u16,
         seqno: Seqno,
-        ack_seqno: Seqno,
         payload: Bytes,
     },
 }
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum RelKind {
     Syn,
     SynAck,
@@ -46,7 +45,7 @@ impl<T> Default for Reorderer<T> {
 
 impl<T> Reorderer<T> {
     pub fn insert(&mut self, seq: Seqno, item: T) {
-        if seq >= self.min && seq <= self.min + 1000 {
+        if seq >= self.min && seq <= self.min + 10000 {
             self.pkts.insert(seq, item);
         }
     }

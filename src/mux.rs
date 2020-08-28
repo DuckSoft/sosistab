@@ -5,7 +5,7 @@ mod multiplex_actor;
 mod relconn;
 mod structs;
 mod timeheap;
-use relconn::RelConn;
+pub use relconn::RelConn;
 
 /// A multiplex session over a sosistab session, implementing both reliable "streams" and unreliable messages.
 #[derive(Clone)]

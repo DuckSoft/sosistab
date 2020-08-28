@@ -10,7 +10,7 @@ pub async fn connect(
     server_addr: SocketAddr,
     pubkey: x25519_dalek::PublicKey,
 ) -> std::io::Result<Session> {
-    let my_addr = smol::unblock!("[::]:0".to_socket_addrs().unwrap().next().unwrap());
+    let my_addr = smol::unblock(|| "[::]:0".to_socket_addrs().unwrap().next().unwrap()).await;
     let udp_socket = Async::<UdpSocket>::bind(my_addr)?;
     let my_long_sk = x25519_dalek::StaticSecret::new(&mut rand::thread_rng());
     let my_eph_sk = x25519_dalek::StaticSecret::new(&mut rand::thread_rng());
@@ -32,7 +32,7 @@ pub async fn connect(
         let res = udp_socket
             .recv_from(&mut buf)
             .or(async {
-                smol::Timer::new(Duration::from_secs(timeout_factor)).await;
+                smol::Timer::after(Duration::from_secs(timeout_factor)).await;
                 Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "timed out",
@@ -146,8 +146,8 @@ async fn init_session(
         })
     };
     let mut session = Session::new(SessionConfig {
-        latency: std::time::Duration::from_millis(1),
-        target_loss: 0.005,
+        latency: std::time::Duration::from_millis(5),
+        target_loss: 0.01,
         send_frame: send_frame_out,
         recv_frame: recv_frame_in,
     });

@@ -1,20 +1,22 @@
-use async_executor::Executor;
 use lazy_static::lazy_static;
 use smol::prelude::*;
+use smol::Executor;
 use std::sync::Arc;
 use std::thread;
 
 lazy_static! {
     static ref EXECUTOR: Arc<Executor> = {
         let ex = Arc::new(Executor::new());
-        let builder = thread::Builder::new().name("sosistab-worker".into());
-        {
-            let ex = ex.clone();
-            builder
-                .spawn(move || {
-                    ex.run(smol::future::pending::<()>());
-                })
-                .unwrap();
+        for i in 1..=num_cpus::get() {
+            let builder = thread::Builder::new().name(format!("sosistab-{}", i));
+            {
+                let ex = ex.clone();
+                builder
+                    .spawn(move || {
+                        smol::future::block_on(ex.run(smol::future::pending::<()>()));
+                    })
+                    .unwrap();
+            }
         }
         ex
     };
