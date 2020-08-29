@@ -5,13 +5,6 @@ use std::net::{
     Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream, ToSocketAddrs, UdpSocket,
 };
 
-#[cfg(not(target_env = "msvc"))]
-use jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
-
 fn main() {
     env_logger::init();
     let socket = UdpSocket::bind("[::]:12345").unwrap();

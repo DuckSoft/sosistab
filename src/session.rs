@@ -4,9 +4,9 @@ use crate::runtime;
 use async_channel::{Receiver, Sender};
 use bytes::Bytes;
 use smol::prelude::*;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 async fn infal<T, E, F: Future<Output = std::result::Result<T, E>>>(fut: F) -> T {
     match fut.await {
@@ -99,11 +99,6 @@ async fn session_loop(cfg: SessionConfig, recv_tosend: Receiver<Bytes>, send_inp
             // encode into raptor
             let encoded = FrameEncoder::new(loss_to_u8(cfg.target_loss))
                 .encode(measured_loss.load(Ordering::Relaxed), &to_send);
-            // log::trace!(
-            //     "send_loop: encoding {} => {} frames",
-            //     to_send.len(),
-            //     encoded.len()
-            // );
             for bts in encoded {
                 if frame_no % 1000 == 0 {
                     log::debug!(
@@ -132,8 +127,7 @@ async fn session_loop(cfg: SessionConfig, recv_tosend: Receiver<Bytes>, send_inp
     // receive loop
     let recv_loop = async {
         let mut rp_filter = ReplayFilter::new(0);
-        let mut reconstruction_buffer = None;
-        let mut run_no = 0u64;
+        let mut decoder = RunDecoder::default();
         let mut loss_calc = LossCalculator::new();
         loop {
             let new_frame = infal(cfg.recv_frame.recv()).await;
@@ -145,16 +139,12 @@ async fn session_loop(cfg: SessionConfig, recv_tosend: Receiver<Bytes>, send_inp
                 continue;
             }
             loss_calc.update_params(new_frame.high_recv_frame_no, new_frame.total_recv_frames);
-            measured_loss.store(loss_to_u8(loss_calc.median).min(128), Ordering::Relaxed);
+            measured_loss.store(loss_to_u8(loss_calc.median), Ordering::Relaxed);
             high_recv_frame_no.fetch_max(new_frame.frame_no, Ordering::Relaxed);
             total_recv_frames.fetch_add(1, Ordering::Relaxed);
-            if new_frame.run_no > run_no || reconstruction_buffer.is_none() {
-                reconstruction_buffer =
-                    Some(FrameDecoder::new(new_frame.run_no, new_frame.run_len));
-                run_no = new_frame.run_no;
-            }
-            let rcb = reconstruction_buffer.as_mut().unwrap();
-            if let Some(output) = rcb.decode(&new_frame.body) {
+            if let Some(output) =
+                decoder.input(new_frame.run_no, new_frame.run_len, &new_frame.body)
+            {
                 for item in output {
                     let _ = send_input.try_send(item);
                 }
@@ -162,6 +152,36 @@ async fn session_loop(cfg: SessionConfig, recv_tosend: Receiver<Bytes>, send_inp
         }
     };
     smol::future::race(send_loop, recv_loop).await;
+}
+
+/// A reordering-resistant FEC reconstructor
+#[derive(Default)]
+struct RunDecoder {
+    top_run: u64,
+    bottom_run: u64,
+    decoders: HashMap<u64, FrameDecoder>,
+}
+
+impl RunDecoder {
+    fn input(&mut self, run_no: u64, total_len: u32, bts: &[u8]) -> Option<Vec<Bytes>> {
+        if run_no >= self.bottom_run {
+            if run_no > self.top_run {
+                self.top_run = run_no;
+                // advance bottom
+                while self.top_run - self.bottom_run > 100 {
+                    self.decoders.remove(&self.bottom_run);
+                    self.bottom_run += 1;
+                }
+            }
+            let decoder = self
+                .decoders
+                .entry(run_no)
+                .or_insert_with(|| FrameDecoder::new(run_no, total_len));
+            decoder.decode(bts)
+        } else {
+            None
+        }
+    }
 }
 
 /// A filter for replays. Records recently seen seqnos and rejects either repeats or really old seqnos.
@@ -226,23 +246,24 @@ impl LossCalculator {
     }
 
     fn update_params(&mut self, top_seqno: u64, total_seqno: u64) {
-        if total_seqno > self.last_total_seqno + 10 && top_seqno > self.last_top_seqno + 10 {
-            let delta_top = top_seqno.saturating_sub(self.last_top_seqno) as f64;
-            let delta_total = total_seqno.saturating_sub(self.last_total_seqno) as f64;
-            self.last_top_seqno = top_seqno;
-            self.last_total_seqno = total_seqno;
-            let loss_sample = 1.0 - delta_total / delta_top.max(delta_total);
-            self.loss_samples.push_back(loss_sample);
-            if self.loss_samples.len() > 32 {
-                self.loss_samples.pop_front();
-            }
-            let median = {
-                let mut lala: Vec<f64> = self.loss_samples.iter().cloned().collect();
-                lala.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-                lala[lala.len() / 2]
-            };
-            self.median = median
-        }
+        // if total_seqno > self.last_total_seqno + 30 && top_seqno > self.last_top_seqno + 30 {
+        //     let delta_top = top_seqno.saturating_sub(self.last_top_seqno) as f64;
+        //     let delta_total = total_seqno.saturating_sub(self.last_total_seqno) as f64;
+        //     self.last_top_seqno = top_seqno;
+        //     self.last_total_seqno = total_seqno;
+        //     let loss_sample = 1.0 - delta_total / delta_top.max(delta_total);
+        //     self.loss_samples.push_back(loss_sample);
+        //     if self.loss_samples.len() > 100 {
+        //         self.loss_samples.pop_front();
+        //     }
+        //     let median = {
+        //         let mut lala: Vec<f64> = self.loss_samples.iter().cloned().collect();
+        //         lala.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        //         lala[lala.len() / 2]
+        //     };
+        //     self.median = median
+        // }
+        self.median = (1.0 - total_seqno as f64 / top_seqno as f64).max(0.0);
     }
 }
 

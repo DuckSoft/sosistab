@@ -5,25 +5,29 @@ use std::net::{TcpListener, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(not(target_env = "msvc"))]
-use jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
-
 fn main() {
-    env_logger::init();
+    // println!("TEST");
+    // env_logger::init();
+    // println!("YOH");
     smol::block_on(async {
+        // let guard = pprof::ProfilerGuard::new(1000).unwrap();
         let args: Vec<String> = std::env::args().collect();
-        println!("{:?}", args);
-        let pubkey_bts: [u8; 32] = hex::decode(&args[2])
-            .unwrap()
-            .as_slice()
-            .try_into()
-            .unwrap();
+        let pubkey_bts: [u8; 32] = hex::decode(&args.get(2).unwrap_or(
+            &"52a3c5c5fdba402c46aa4d7088a7d9c742b16fede34f8f5beb788f59501b176b".to_string(),
+        ))
+        .unwrap()
+        .as_slice()
+        .try_into()
+        .unwrap();
         let session = sosistab::connect(
-            smol::unblock(move || (&args[1]).to_socket_addrs().unwrap().next().unwrap()).await,
+            smol::unblock(move || {
+                (&args.get(1).unwrap_or(&"54.37.130.165:12345".to_string()))
+                    .to_socket_addrs()
+                    .unwrap()
+                    .next()
+                    .unwrap()
+            })
+            .await,
             x25519_dalek::PublicKey::from(pubkey_bts),
         )
         .await
@@ -46,6 +50,10 @@ fn main() {
                 );
             })
             .detach();
+            // if let Ok(report) = guard.report().build() {
+            //     let file = std::fs::File::create("flamegraph.svg").unwrap();
+            //     report.flamegraph(file).unwrap();
+            // };
         }
     })
 }

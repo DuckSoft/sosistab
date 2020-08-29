@@ -19,7 +19,11 @@ pub enum HandshakeFrame {
 
     /// Frame sent from client to server to either signal roaming, or complete an initial handshake. This is globally encrypted.
     /// Clients should send a ClientResume every time they suspect that their IP has changed.
-    ClientResume { resume_token: Bytes },
+    ClientResume {
+        resume_token: Bytes,
+        /// Which shard is this
+        shard_id: u8,
+    },
 }
 
 /// Frame sent as an per-session message. This is always encrypted with a per-session key.

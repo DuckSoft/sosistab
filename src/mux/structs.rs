@@ -50,7 +50,6 @@ impl<T: Clone> Reorderer<T> {
             self.pkts.insert(seq, item);
             true
         } else {
-            eprintln!("discarding {} (min={})", seq, self.min);
             false
         }
     }

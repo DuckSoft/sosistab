@@ -1,16 +1,20 @@
 use crate::*;
 use async_dup::Arc;
 use bytes::Bytes;
+use rand::Rng;
 use smol::prelude::*;
 use smol::Async;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 pub async fn connect(
     server_addr: SocketAddr,
     pubkey: x25519_dalek::PublicKey,
 ) -> std::io::Result<Session> {
-    let my_addr = smol::unblock(|| "[::]:0".to_socket_addrs().unwrap().next().unwrap()).await;
+    let my_addr = smol::unblock(|| "0.0.0.0:0".to_socket_addrs().unwrap().next().unwrap()).await;
     let udp_socket = Async::<UdpSocket>::bind(my_addr)?;
     let my_long_sk = x25519_dalek::StaticSecret::new(&mut rand::thread_rng());
     let my_eph_sk = x25519_dalek::StaticSecret::new(&mut rand::thread_rng());
@@ -94,65 +98,80 @@ async fn init_session(
     shared_sec: blake3::Hash,
     remote_addr: SocketAddr,
 ) -> std::io::Result<Session> {
-    let udp_socket = Arc::new(udp_socket);
+    const SHARDS: u8 = 32;
+
+    let mut udp_sockets = vec![Arc::new(udp_socket)];
+    for _ in 0..SHARDS - 1 {
+        let my_addr =
+            smol::unblock(|| "0.0.0.0:0".to_socket_addrs().unwrap().next().unwrap()).await;
+        let udp_socket = Async::<UdpSocket>::bind(my_addr)?;
+        udp_sockets.push(Arc::new(udp_socket));
+    }
     let up_key = blake3::keyed_hash(crypt::UP_KEY, shared_sec.as_bytes());
     let dn_key = blake3::keyed_hash(crypt::DN_KEY, shared_sec.as_bytes());
     let (send_frame_out, recv_frame_out) = async_channel::bounded::<msg::DataFrame>(100);
     let (send_frame_in, recv_frame_in) = async_channel::bounded::<msg::DataFrame>(100);
+    let download_tasks: Vec<smol::Task<Option<()>>> = (0..SHARDS)
+        .map(|shard_id| {
+            let udp_socket = udp_sockets[shard_id as usize].clone();
+            let send_frame_in = send_frame_in.clone();
+            runtime::spawn(async move {
+                let dn_crypter = crypt::StdAEAD::new(dn_key.as_bytes());
+                let mut buf = [0u8; 2048];
+                loop {
+                    let (n, _) = udp_socket.recv_from(&mut buf).await.unwrap();
+                    if let Some(plain) = dn_crypter.pad_decrypt::<msg::DataFrame>(&buf[..n]) {
+                        log::trace!("shard {} decrypted UDP message with len {}", shard_id, n);
+                        send_frame_in.send(plain).await.unwrap();
+                    }
+                }
+            })
+        })
+        .collect();
     let upload_task: smol::Task<Option<()>> = {
-        let udp_socket = udp_socket.clone();
         runtime::spawn(async move {
             let up_crypter = crypt::StdAEAD::new(up_key.as_bytes());
-            let mut last_restok: Option<Instant> = None;
+            let mut last_restoks = HashMap::new();
             loop {
+                let shard_id = rand::thread_rng().gen::<u8>() % SHARDS;
+                let udp_socket = udp_sockets[shard_id as usize].clone();
                 let resume_token = resume_token.clone();
                 let df = recv_frame_out.recv().await.ok()?;
-                let send_token = match last_restok {
+                let send_token = match last_restoks.get(&shard_id) {
                     None => true,
-                    Some(time) => Instant::now().saturating_duration_since(time).as_secs() > 10,
+                    Some(time) => Instant::now().saturating_duration_since(*time).as_secs() > 10,
                 };
                 if send_token {
-                    log::trace!("resending resume token...");
+                    log::trace!("resending resume token {}...", shard_id);
                     let g_encrypt = crypt::StdAEAD::new(&cookie.generate_c2s().next().unwrap());
                     udp_socket
                         .send_to(
                             &g_encrypt.pad_encrypt(
-                                msg::HandshakeFrame::ClientResume { resume_token },
+                                msg::HandshakeFrame::ClientResume {
+                                    resume_token,
+                                    shard_id,
+                                },
                                 1300,
                             ),
                             remote_addr,
                         )
                         .await
                         .unwrap();
-                    last_restok = Some(Instant::now());
+                    last_restoks.insert(shard_id, Instant::now());
                 }
                 let encrypted = up_crypter.pad_encrypt(df, 1300);
-                drop(udp_socket.get_ref().send_to(&encrypted, remote_addr));
-            }
-        })
-    };
-    let download_task: smol::Task<Option<()>> = {
-        let udp_socket = udp_socket;
-        runtime::spawn(async move {
-            let dn_crypter = crypt::StdAEAD::new(dn_key.as_bytes());
-            let mut buf = [0u8; 2048];
-            loop {
-                let (n, _) = udp_socket.recv_from(&mut buf).await.unwrap();
-                if let Some(plain) = dn_crypter.pad_decrypt::<msg::DataFrame>(&buf[..n]) {
-                    log::trace!("decrypted UDP message with len {}", n);
-                    send_frame_in.send(plain).await.unwrap();
-                }
+                drop(udp_socket.send_to(&encrypted, remote_addr).await);
             }
         })
     };
     let mut session = Session::new(SessionConfig {
         latency: std::time::Duration::from_millis(5),
-        target_loss: 0.01,
+        target_loss: 0.005,
         send_frame: send_frame_out,
         recv_frame: recv_frame_in,
     });
     session.on_drop(move || {
-        drop(download_task);
+        drop(download_tasks);
         drop(upload_task);
     });
     Ok(session)

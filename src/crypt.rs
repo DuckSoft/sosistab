@@ -149,6 +149,7 @@ mod tests {
     }
 }
 
+#[derive(Debug, Clone)]
 /// Cookie is a generator of temporary symmetric keys.
 pub struct Cookie(x25519_dalek::PublicKey);
 

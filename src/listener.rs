@@ -4,12 +4,14 @@ use async_channel::{Receiver, Sender};
 use async_dup::Arc;
 use async_lock::Lock;
 use bytes::Bytes;
+use indexmap::IndexMap;
 use msg::HandshakeFrame::*;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use smol::Async;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::Mutex;
 use std::time::Duration;
 
 pub struct Listener {
@@ -42,6 +44,8 @@ impl Listener {
     }
 }
 
+type ShardedAddrs = IndexMap<u8, SocketAddr>;
+
 struct ListenerActor {
     socket: Async<UdpSocket>,
     cookie: crypt::Cookie,
@@ -50,11 +54,8 @@ struct ListenerActor {
 impl ListenerActor {
     #[allow(clippy::mutable_key_type)]
     async fn run(self, accepted: Sender<Session>) -> std::io::Result<()> {
-        let mut addr_to_session: HashMap<
-            SocketAddr,
-            (Sender<msg::DataFrame>, crypt::StdAEAD, Lock<SocketAddr>),
-        > = HashMap::new();
-        let mut token_to_addr: HashMap<Bytes, SocketAddr> = HashMap::new();
+        let mut session_table = SessionTable::default();
+
         let token_key = {
             let mut buf = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut buf);
@@ -68,11 +69,14 @@ impl ListenerActor {
             let (n, addr) = socket.recv_from(&mut buffer).await?;
             let buffer = &buffer[..n];
             // first we attempt to map this to an existing session
-            if let Some((sess, sess_crypt, _)) = addr_to_session.get(&addr) {
+            if let Some((sess, sess_crypt)) = session_table.lookup(addr) {
                 // try feeding it into the session
                 if let Some(dframe) = sess_crypt.pad_decrypt::<msg::DataFrame>(buffer) {
+                    log::trace!("{} associated with existing session", addr);
                     drop(sess.try_send(dframe));
                     continue;
+                } else {
+                    log::trace!("{} NOT associated with existing session", addr);
                 }
             }
             // we know it's not part of an existing session then. we decrypt it under the current key
@@ -120,22 +124,16 @@ impl ListenerActor {
                             socket.send_to(&reply, addr).await?;
                             log::trace!("replied to ClientHello from {}", addr);
                         }
-                        ClientResume { resume_token } => {
+                        ClientResume {
+                            resume_token,
+                            shard_id,
+                        } => {
+                            log::trace!("Got ClientResume-{} from {}!", shard_id, addr);
                             // first check whether we know about the resume token
-                            if let Some(old_addr) = token_to_addr.get_mut(&resume_token) {
-                                log::trace!(
-                                    "ClientResume from {} corresponding to old {}",
-                                    addr,
-                                    old_addr
-                                );
-                                if *old_addr != addr {
-                                    let (sess, aead, locked_addr) =
-                                        addr_to_session.remove(old_addr).unwrap();
-                                    *locked_addr.lock().await = addr;
-                                    addr_to_session.insert(addr, (sess, aead, locked_addr));
-                                    *old_addr = addr;
-                                }
-                            } else {
+                            if !session_table
+                                .rebind(addr, shard_id, resume_token.clone())
+                                .await
+                            {
                                 log::trace!("ClientResume from {} is new!", addr);
                                 let tokinfo = TokenInfo::decrypt(&token_key, &resume_token);
                                 if let Some(tokinfo) = tokinfo {
@@ -151,23 +149,36 @@ impl ListenerActor {
                                     // create session
                                     let (session_output_send, session_output_recv) =
                                         async_channel::bounded::<msg::DataFrame>(100);
+                                    let mut locked_addrs = IndexMap::new();
+                                    locked_addrs.insert(shard_id, addr);
                                     // send for poll
-                                    let locked_addr = Lock::new(addr);
+                                    let locked_addrs = Lock::new(locked_addrs);
                                     let output_poller = {
-                                        let locked_addr = locked_addr.clone();
+                                        let locked_addrs = locked_addrs.clone();
                                         runtime::spawn(async move {
+                                            let mut ctr = 0u8;
                                             loop {
                                                 match session_output_recv.recv().await {
                                                     Ok(df) => {
                                                         let enc = dn_aead.pad_encrypt(&df, 1300);
-                                                        drop(
-                                                            socket
-                                                                .send_to(
-                                                                    &enc,
-                                                                    *locked_addr.lock().await,
+                                                        let addrs = locked_addrs.lock().await;
+                                                        assert!(!addrs.is_empty());
+                                                        loop {
+                                                            ctr = ctr.wrapping_add(1);
+                                                            if let Some((_, remote_addr)) = addrs
+                                                                .get_index(
+                                                                    (ctr % (addrs.len() as u8))
+                                                                        as usize,
                                                                 )
-                                                                .await,
-                                                        );
+                                                            {
+                                                                drop(
+                                                                    socket
+                                                                        .send_to(&enc, *remote_addr)
+                                                                        .await,
+                                                                );
+                                                                break;
+                                                            }
+                                                        }
                                                     }
                                                     Err(_) => smol::future::pending::<()>().await,
                                                 }
@@ -176,7 +187,7 @@ impl ListenerActor {
                                     };
                                     let mut session = Session::new(SessionConfig {
                                         latency: Duration::from_millis(5),
-                                        target_loss: 0.01,
+                                        target_loss: 0.005,
                                         send_frame: session_output_send,
                                         recv_frame: session_input_recv,
                                     });
@@ -184,9 +195,13 @@ impl ListenerActor {
                                         drop(output_poller);
                                     });
                                     // spawn a task that writes to the socket.
-                                    addr_to_session
-                                        .insert(addr, (session_input, up_aead, locked_addr));
-                                    token_to_addr.insert(resume_token, addr);
+                                    session_table.new_sess(
+                                        resume_token.clone(),
+                                        session_input,
+                                        up_aead,
+                                        locked_addrs,
+                                    );
+                                    session_table.rebind(addr, shard_id, resume_token).await;
                                     drop(accepted.send(session).await);
                                 } else {
                                     log::warn!("ClientResume from {} can't be decrypted", addr);
@@ -222,5 +237,44 @@ impl TokenInfo {
             &bincode::serialize(self).expect("must serialize"),
             rng.gen(),
         )
+    }
+}
+
+#[derive(Default)]
+struct SessionTable {
+    token_to_sess: HashMap<Bytes, (Sender<msg::DataFrame>, crypt::StdAEAD, Lock<ShardedAddrs>)>,
+    addr_to_token: HashMap<SocketAddr, Bytes>,
+}
+
+impl SessionTable {
+    async fn rebind(&mut self, addr: SocketAddr, shard_id: u8, token: Bytes) -> bool {
+        if let Some((_, _, addrs)) = self.token_to_sess.get(&token) {
+            let old = addrs.lock().await.insert(shard_id, addr);
+            log::trace!("binding {}=>{}", shard_id, addr);
+            if let Some(old) = old {
+                self.addr_to_token.remove(&old);
+            }
+            self.addr_to_token.insert(addr, token);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn lookup(&self, addr: SocketAddr) -> Option<(&Sender<msg::DataFrame>, &crypt::StdAEAD)> {
+        let token = self.addr_to_token.get(&addr)?;
+        let (s, a, _) = self.token_to_sess.get(token)?;
+        Some((s, a))
+    }
+
+    fn new_sess(
+        &mut self,
+        token: Bytes,
+        sender: Sender<msg::DataFrame>,
+        aead: crypt::StdAEAD,
+        locked_addrs: Lock<ShardedAddrs>,
+    ) {
+        self.token_to_sess
+            .insert(token, (sender, aead, locked_addrs));
     }
 }
