@@ -67,7 +67,7 @@ pub async fn multiplex(
                     } => {
                         if let Some(handle) = conn_tab.read().await.get_stream(stream_id) {
                             log::trace!("handing over {:?} to {}", kind, stream_id);
-                            handle.process(msg)
+                            handle.process(msg).await
                         } else {
                             log::trace!("discarding {:?} to nonexistent {}", kind, stream_id);
                             if kind != RelKind::Rst {

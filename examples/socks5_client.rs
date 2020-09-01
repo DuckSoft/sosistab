@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 fn main() {
     // println!("TEST");
-    // env_logger::init();
+    env_logger::builder().parse_filters("debug").init();
     // println!("YOH");
     smol::block_on(async {
         // let guard = pprof::ProfilerGuard::new(1000).unwrap();
@@ -21,7 +21,9 @@ fn main() {
         .unwrap();
         let session = sosistab::connect(
             smol::unblock(move || {
-                (&args.get(1).unwrap_or(&"54.37.130.165:12345".to_string()))
+                (&args
+                    .get(1)
+                    .unwrap_or(&"sosistab-jp-test.labooyah.be:12345".to_string()))
                     .to_socket_addrs()
                     .unwrap()
                     .next()

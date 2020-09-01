@@ -7,17 +7,11 @@ use std::net::{
 
 fn main() {
     env_logger::init();
-    let socket = UdpSocket::bind("[::]:12345").unwrap();
     let mut badrng = rand::rngs::StdRng::seed_from_u64(0);
     let mut worstrng = rand::rngs::SmallRng::seed_from_u64(0);
     smol::block_on(async move {
         let long_sk = x25519_dalek::StaticSecret::new(&mut badrng);
-        println!(
-            "listening at {} with {:?}",
-            socket.local_addr().unwrap(),
-            hex::encode(x25519_dalek::PublicKey::from(&long_sk).as_bytes())
-        );
-        let listener = sosistab::Listener::listen(socket, long_sk);
+        let listener = sosistab::Listener::listen("[::]:12345", long_sk).await;
         loop {
             let socket = listener.accept_session().await.unwrap();
             println!("accepted session");

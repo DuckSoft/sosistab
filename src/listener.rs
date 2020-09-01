@@ -3,15 +3,14 @@ use crate::*;
 use async_channel::{Receiver, Sender};
 use async_dup::Arc;
 use async_lock::Lock;
+use async_net::{AsyncToSocketAddrs, UdpSocket};
 use bytes::Bytes;
 use indexmap::IndexMap;
 use msg::HandshakeFrame::*;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
-use smol::Async;
 use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
-use std::sync::Mutex;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 pub struct Listener {
@@ -25,8 +24,11 @@ impl Listener {
         self.accepted.recv().await.ok()
     }
     /// Creates a new listener given the parameters.
-    pub fn listen(socket: UdpSocket, long_sk: x25519_dalek::StaticSecret) -> Self {
-        let socket = Async::new(socket).unwrap();
+    pub async fn listen(
+        addr: impl AsyncToSocketAddrs,
+        long_sk: x25519_dalek::StaticSecret,
+    ) -> Self {
+        let socket = UdpSocket::bind(addr).await.unwrap();
         let cookie = crypt::Cookie::new((&long_sk).into());
         let (send, recv) = async_channel::unbounded();
         let task = runtime::spawn(
@@ -47,7 +49,7 @@ impl Listener {
 type ShardedAddrs = IndexMap<u8, SocketAddr>;
 
 struct ListenerActor {
-    socket: Async<UdpSocket>,
+    socket: UdpSocket,
     cookie: crypt::Cookie,
     long_sk: x25519_dalek::StaticSecret,
 }

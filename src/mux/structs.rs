@@ -50,6 +50,7 @@ impl<T: Clone> Reorderer<T> {
             self.pkts.insert(seq, item);
             true
         } else {
+            log::trace!("rejecting (seq={}, min={})", seq, self.min);
             false
         }
     }

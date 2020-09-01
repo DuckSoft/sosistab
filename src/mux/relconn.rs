@@ -1,7 +1,6 @@
 use crate::*;
 use async_channel::{Receiver, Sender};
 use bytes::Bytes;
-use futures::prelude::*;
 use mux::structs::{Message, RelKind, Reorderer, Seqno};
 use smol::prelude::*;
 use std::{
@@ -346,8 +345,8 @@ pub(crate) struct RelConnBack {
 }
 
 impl RelConnBack {
-    pub fn process(&self, input: Message) {
-        drop(self.send_wire_read.try_send(input))
+    pub async fn process(&self, input: Message) {
+        drop(self.send_wire_read.send(input).await)
     }
 }
 
@@ -389,12 +388,12 @@ impl ConnVars {
         if Instant::now()
             .saturating_duration_since(self.last_loss)
             .as_millis()
-            > 500
+            > 1500
         {
             self.cwnd_max = self.cwnd;
             let now = self.cubic_update();
             self.last_loss = now;
-            eprintln!("LOSS CWND => {}", self.cwnd);
+            // eprintln!("LOSS CWND => {}", self.cwnd);
         }
     }
 

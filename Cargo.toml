@@ -9,13 +9,14 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
-#lto = true
+lto = "thin"
 
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 smol="0.4"
+socket2="0.3"
 async-rwlock="1"
 ed25519-dalek={version="1.0.0-pre.4", features=["serde"]}
 x25519-dalek={version="0.6", features=["serde"]}
@@ -35,12 +36,11 @@ async-lock="1"
 async-mutex="1.1"
 priority-queue="1"
 snap="1"
+futures="0.3"
 async-dup="1"
 lazy_static = "1.4.0"
 num_cpus="1"
 anyhow="1"
-futures="0.3"
-dashmap = "3.11.7"
 scopeguard="1"
 async-net="1"
 indexmap="1.5"
