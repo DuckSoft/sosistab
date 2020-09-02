@@ -3,15 +3,10 @@ use async_channel::{Receiver, Sender};
 use async_dup::Arc;
 use async_lock::Lock;
 use async_net::UdpSocket;
-use async_rwlock::RwLock;
 use bytes::Bytes;
-use rand::Rng;
 use smol::prelude::*;
 use std::net::SocketAddr;
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 pub async fn connect(
     server_addr: SocketAddr,
@@ -99,7 +94,7 @@ async fn init_session(
     let recv_frame_out = Lock::new(recv_frame_out);
     let backhaul_tasks: Vec<_> = (0..SHARDS)
         .map(|i| {
-            client_backhaul_once(
+            runtime::spawn(client_backhaul_once(
                 cookie.clone(),
                 resume_token.clone(),
                 send_frame_in.clone(),
@@ -107,19 +102,17 @@ async fn init_session(
                 i,
                 remote_addr,
                 shared_sec,
-            )
-            .boxed()
+            ))
         })
         .collect();
-    let backhaul = runtime::spawn(futures::future::join_all(backhaul_tasks));
     let mut session = Session::new(SessionConfig {
-        latency: std::time::Duration::from_millis(5),
-        target_loss: 0.005,
+        latency: std::time::Duration::from_millis(10),
+        target_loss: 0.01,
         send_frame: send_frame_out,
         recv_frame: recv_frame_in,
     });
     session.on_drop(move || {
-        drop(backhaul);
+        drop(backhaul_tasks);
     });
     Ok(session)
 }
@@ -135,12 +128,14 @@ async fn client_backhaul_once(
 ) -> Option<()> {
     let up_key = blake3::keyed_hash(crypt::UP_KEY, shared_sec.as_bytes());
     let dn_key = blake3::keyed_hash(crypt::DN_KEY, shared_sec.as_bytes());
-    let mut socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
     let dn_crypter = Arc::new(crypt::StdAEAD::new(dn_key.as_bytes()));
     let up_crypter = Arc::new(crypt::StdAEAD::new(up_key.as_bytes()));
     let mut buf = [0u8; 2048];
 
-    let mut last_refresh = Instant::now() - Duration::from_secs(1000);
+    let mut last_resume = Instant::now();
+    let mut refreshed = false;
+    let mut socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    let mut old_socket_cleanup: Option<smol::Task<Option<()>>> = None;
 
     #[derive(Debug)]
     enum Evt {
@@ -150,13 +145,16 @@ async fn client_backhaul_once(
 
     loop {
         let down_socket = socket.clone();
-        let dn_crypter = dn_crypter.clone();
-        let down = async move {
-            let (n, _) = down_socket.recv_from(&mut buf).await.ok()?;
-            loop {
-                if let Some(plain) = dn_crypter.pad_decrypt::<msg::DataFrame>(&buf[..n]) {
-                    log::trace!("shard {} decrypted UDP message with len {}", shard_id, n);
-                    break Some(Evt::Incoming(plain));
+        let down = {
+            let dn_crypter = dn_crypter.clone();
+            let send_frame_in = send_frame_in.clone();
+            async move {
+                let (n, _) = down_socket.recv_from(&mut buf).await.ok()?;
+                loop {
+                    if let Some(plain) = dn_crypter.pad_decrypt::<msg::DataFrame>(&buf[..n]) {
+                        log::trace!("shard {} decrypted UDP message with len {}", shard_id, n);
+                        break Some(Evt::Incoming(plain));
+                    }
                 }
             }
         };
@@ -168,26 +166,46 @@ async fn client_backhaul_once(
         };
         match smol::future::race(down, up).await {
             Some(Evt::Incoming(df)) => {
+                old_socket_cleanup.take();
                 send_frame_in.send(df).await.ok()?;
             }
             Some(Evt::Outgoing(bts)) => {
-                if Instant::now()
-                    .saturating_duration_since(last_refresh)
-                    .as_secs()
-                    > 2
-                {
-                    last_refresh = Instant::now();
+                let now = Instant::now();
+                if now.saturating_duration_since(last_resume).as_millis() > 2000 || !refreshed {
+                    refreshed = true;
+                    last_resume = Instant::now();
                     let g_encrypt = crypt::StdAEAD::new(&cookie.generate_c2s().next().unwrap());
                     // also replace the UDP socket!
-                    socket = loop {
-                        match UdpSocket::bind("0.0.0.0:0").await {
-                            Ok(sock) => break sock,
-                            Err(err) => {
-                                log::warn!("error rebinding: {}", err);
-                                smol::Timer::after(Duration::from_secs(1)).await;
+                    if old_socket_cleanup.is_none() {
+                        let old_socket = socket.clone();
+                        let dn_crypter = dn_crypter.clone();
+                        let send_frame_in = send_frame_in.clone();
+                        // spawn a task to clean up the UDP socket
+                        old_socket_cleanup = Some(runtime::spawn(async move {
+                            loop {
+                                let (n, _) = old_socket.recv_from(&mut buf).await.ok()?;
+                                if let Some(plain) =
+                                    dn_crypter.pad_decrypt::<msg::DataFrame>(&buf[..n])
+                                {
+                                    log::trace!(
+                                        "shard {} decrypted UDP message with len {}",
+                                        shard_id,
+                                        n
+                                    );
+                                    drop(send_frame_in.send(plain).await)
+                                }
                             }
-                        }
-                    };
+                        }));
+                        socket = loop {
+                            match UdpSocket::bind("0.0.0.0:0").await {
+                                Ok(sock) => break sock,
+                                Err(err) => {
+                                    log::warn!("error rebinding: {}", err);
+                                    smol::Timer::after(Duration::from_secs(1)).await;
+                                }
+                            }
+                        };
+                    }
                     log::debug!(
                         "resending resume token {} to {} from {}...",
                         shard_id,
@@ -214,5 +232,4 @@ async fn client_backhaul_once(
             _ => unimplemented!(),
         }
     }
-    unimplemented!()
 }

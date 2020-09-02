@@ -10,7 +10,7 @@ pub struct InflightEntry {
     seqno: Seqno,
     acked: bool,
     send_time: Instant,
-    retrans: u64,
+    pub retrans: u64,
     pub payload: Message,
 }
 
@@ -24,6 +24,18 @@ pub struct Inflight {
 impl Inflight {
     pub fn len(&self) -> usize {
         self.segments.len()
+    }
+
+    pub fn rto(&self) -> Duration {
+        self.rtt.rto()
+    }
+
+    pub fn srtt(&self) -> u64 {
+        self.rtt.srtt
+    }
+
+    pub fn bdp(&self) -> f64 {
+        self.rtt.bdp()
     }
 
     pub fn mark_acked(&mut self, seqno: Seqno) {
@@ -115,6 +127,10 @@ struct RttCalculator {
     rttvar: u64,
     rto: u64,
     existing: bool,
+
+    deliv_rate: f64,
+    last_deliv_time: Instant,
+    dels_since_last: u64,
 }
 
 impl Default for RttCalculator {
@@ -123,7 +139,10 @@ impl Default for RttCalculator {
             srtt: 1000,
             rttvar: 1000,
             rto: 1000,
+            deliv_rate: 100.0,
+            last_deliv_time: Instant::now(),
             existing: false,
+            dels_since_last: 0,
         }
     }
 }
@@ -139,6 +158,20 @@ impl RttCalculator {
             self.srtt = self.srtt * 7 / 8 + sample / 8;
         }
         self.rto = self.srtt + (4 * self.rttvar).max(10);
+        // // delivery rate
+        // self.dels_since_last += 1;
+        // if self.dels_since_last >= 100 {
+        //     let now = Instant::now();
+        //     let drate_sample = 100.0 / now.duration_since(self.last_deliv_time).as_secs_f64();
+        //     self.deliv_rate = drate_sample * 0.1 + self.deliv_rate * 0.9;
+        //     self.last_deliv_time = now;
+        //     self.dels_since_last = 0;
+        //     dbg!(self.deliv_rate);
+        // }
+    }
+
+    fn bdp(&self) -> f64 {
+        self.deliv_rate * (self.srtt as f64) / 1000.0
     }
 
     fn rto(&self) -> Duration {

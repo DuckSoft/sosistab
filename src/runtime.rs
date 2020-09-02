@@ -7,7 +7,7 @@ use std::thread;
 lazy_static! {
     static ref EXECUTOR: Arc<Executor> = {
         let ex = Arc::new(Executor::new());
-        for i in 1..=num_cpus::get() {
+        for i in 1..=1 {
             let builder = thread::Builder::new().name(format!("sosistab-{}", i));
             {
                 let ex = ex.clone();

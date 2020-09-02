@@ -246,24 +246,24 @@ impl LossCalculator {
     }
 
     fn update_params(&mut self, top_seqno: u64, total_seqno: u64) {
-        // if total_seqno > self.last_total_seqno + 30 && top_seqno > self.last_top_seqno + 30 {
-        //     let delta_top = top_seqno.saturating_sub(self.last_top_seqno) as f64;
-        //     let delta_total = total_seqno.saturating_sub(self.last_total_seqno) as f64;
-        //     self.last_top_seqno = top_seqno;
-        //     self.last_total_seqno = total_seqno;
-        //     let loss_sample = 1.0 - delta_total / delta_top.max(delta_total);
-        //     self.loss_samples.push_back(loss_sample);
-        //     if self.loss_samples.len() > 100 {
-        //         self.loss_samples.pop_front();
-        //     }
-        //     let median = {
-        //         let mut lala: Vec<f64> = self.loss_samples.iter().cloned().collect();
-        //         lala.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        //         lala[lala.len() / 2]
-        //     };
-        //     self.median = median
-        // }
-        self.median = (1.0 - total_seqno as f64 / top_seqno as f64).max(0.0);
+        if total_seqno > self.last_total_seqno + 30 && top_seqno > self.last_top_seqno + 30 {
+            let delta_top = top_seqno.saturating_sub(self.last_top_seqno) as f64;
+            let delta_total = total_seqno.saturating_sub(self.last_total_seqno) as f64;
+            self.last_top_seqno = top_seqno;
+            self.last_total_seqno = total_seqno;
+            let loss_sample = 1.0 - delta_total / delta_top.max(delta_total);
+            self.loss_samples.push_back(loss_sample);
+            if self.loss_samples.len() > 1000 {
+                self.loss_samples.pop_front();
+            }
+            let median = {
+                let mut lala: Vec<f64> = self.loss_samples.iter().cloned().collect();
+                lala.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+                lala[lala.len() / 2]
+            };
+            self.median = median
+        }
+        // self.median = (1.0 - total_seqno as f64 / top_seqno as f64).max(0.0);
     }
 }
 

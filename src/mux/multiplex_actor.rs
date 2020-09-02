@@ -16,7 +16,7 @@ pub async fn multiplex(
     conn_accept_send: Sender<RelConn>,
 ) -> anyhow::Result<()> {
     let conn_tab = RwLock::new(ConnTable::default());
-    let (glob_send, glob_recv) = async_channel::bounded(1000);
+    let (glob_send, glob_recv) = async_channel::bounded(10000);
     loop {
         // fires on receiving messages
         let recv_evt = async {
@@ -27,7 +27,7 @@ pub async fn multiplex(
                     // unreliable
                     Message::Urel(bts) => {
                         log::trace!("urel recv {}B", bts.len());
-                        urel_recv_send.send(bts).await?;
+                        drop(urel_recv_send.send(bts).await);
                     }
                     // connection opening
                     Message::Rel {
@@ -58,7 +58,7 @@ pub async fn multiplex(
                             );
                             // the RelConn itself is responsible for sending the SynAck. Here we just store the connection into the table, accept it, and be done with it.
                             conn_tab.set_stream(stream_id, new_conn_back);
-                            conn_accept_send.send(new_conn).await?;
+                            drop(conn_accept_send.send(new_conn).await);
                         }
                     }
                     // associated with existing connection
@@ -129,19 +129,21 @@ pub async fn multiplex(
                     },
                     glob_send.clone(),
                 );
-                result_chan.send(conn).await?;
+                drop(result_chan.send(conn).await);
                 conn_tab.set_stream(stream_id, conn_back);
                 stream_id
             };
             log::trace!("conn open send {}", stream_id);
-            glob_send
-                .send(Message::Rel {
-                    kind: RelKind::Syn,
-                    stream_id,
-                    seqno: 0,
-                    payload: Bytes::new(),
-                })
-                .await?;
+            drop(
+                glob_send
+                    .send(Message::Rel {
+                        kind: RelKind::Syn,
+                        stream_id,
+                        seqno: 0,
+                        payload: Bytes::new(),
+                    })
+                    .await,
+            );
             Ok::<(), anyhow::Error>(())
         };
         // await on them all

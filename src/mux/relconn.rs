@@ -202,7 +202,11 @@ async fn relconn_actor(
                         // retransmit first unacknowledged packet
                         // assert!(!conn_vars.inflight.len() == 0);
                         if conn_vars.inflight.len() > 0 {
-                            conn_vars.congestion_rto();
+                            if let Some(v) = conn_vars.inflight.get_seqno(seqno) {
+                                if v.retrans == 1 {
+                                    conn_vars.congestion_rto();
+                                }
+                            }
                             transmit(conn_vars.inflight.get_seqno(seqno).unwrap().payload.clone())
                                 .await;
                         }
@@ -360,6 +364,9 @@ pub(crate) struct ConnVars {
     cwnd: f64,
     cwnd_max: f64,
     last_loss: Instant,
+
+    cubic_secs: f64,
+    last_cubic: Instant,
 }
 
 impl Default for ConnVars {
@@ -371,39 +378,46 @@ impl Default for ConnVars {
             reorderer: Reorderer::default(),
             lowest_unseen: 0,
 
-            cwnd: 1.0,
+            cwnd: 16.0,
             cwnd_max: 100.0,
             last_loss: Instant::now(),
+            cubic_secs: 0.0,
+            last_cubic: Instant::now(),
         }
     }
 }
 
 impl ConnVars {
     fn congestion_ack(&mut self) {
-        self.cubic_update();
-        //self.cwnd += 1.0 / self.cwnd;
+        self.cubic_update(Instant::now());
+        // self.cwnd += 4.0 / self.cwnd;
+        // eprintln!("ACK CWND => {}", self.cwnd);
     }
 
     fn congestion_rto(&mut self) {
-        if Instant::now()
-            .saturating_duration_since(self.last_loss)
-            .as_millis()
-            > 1500
-        {
+        if Instant::now().saturating_duration_since(self.last_loss) > self.inflight.rto() * 2 {
             self.cwnd_max = self.cwnd;
-            let now = self.cubic_update();
+            let now = Instant::now();
             self.last_loss = now;
+            self.cubic_secs = 0.0;
+            self.cubic_update(now);
+            // self.last_loss = Instant::now();
+            // self.cwnd *= 0.8;
             // eprintln!("LOSS CWND => {}", self.cwnd);
         }
     }
 
-    fn cubic_update(&mut self) -> Instant {
-        let now = Instant::now();
-        let t = now.saturating_duration_since(self.last_loss).as_secs_f64() * 4.0;
+    fn cubic_update(&mut self, now: Instant) {
+        let delta_t = now
+            .saturating_duration_since(self.last_cubic)
+            .as_secs_f64()
+            .min(0.1);
+        self.last_cubic = now;
+        self.cubic_secs += delta_t;
+        let t = self.cubic_secs;
         let k = (self.cwnd_max / 2.0).powf(0.333);
         let wt = 0.4 * (t - k).powf(3.0) + self.cwnd_max;
-        let new_cwnd = wt.min(1000.0);
+        let new_cwnd = wt.min(10000.0);
         self.cwnd = new_cwnd;
-        now
     }
 }
