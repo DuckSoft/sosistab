@@ -9,7 +9,6 @@ use indexmap::IndexMap;
 use msg::HandshakeFrame::*;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
-use smol::prelude::*;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -230,6 +229,7 @@ impl ListenerActor {
                                             let send_dead_clo = send_dead.clone();
                                             let resume_token_clo = resume_token.clone();
                                             session.on_drop(move || {
+                                                drop(output_poller);
                                                 drop(send_dead_clo.try_send(resume_token_clo))
                                             });
                                             // spawn a task that writes to the socket.

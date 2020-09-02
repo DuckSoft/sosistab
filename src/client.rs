@@ -147,7 +147,6 @@ async fn client_backhaul_once(
         let down_socket = socket.clone();
         let down = {
             let dn_crypter = dn_crypter.clone();
-            let send_frame_in = send_frame_in.clone();
             async move {
                 let (n, _) = down_socket.recv_from(&mut buf).await.ok()?;
                 loop {

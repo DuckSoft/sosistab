@@ -30,14 +30,6 @@ impl Inflight {
         self.rtt.rto()
     }
 
-    pub fn srtt(&self) -> u64 {
-        self.rtt.srtt
-    }
-
-    pub fn bdp(&self) -> f64 {
-        self.rtt.bdp()
-    }
-
     pub fn mark_acked(&mut self, seqno: Seqno) {
         // mark the right one
         if let Some(entry) = self.segments.front() {
@@ -127,10 +119,6 @@ struct RttCalculator {
     rttvar: u64,
     rto: u64,
     existing: bool,
-
-    deliv_rate: f64,
-    last_deliv_time: Instant,
-    dels_since_last: u64,
 }
 
 impl Default for RttCalculator {
@@ -139,10 +127,7 @@ impl Default for RttCalculator {
             srtt: 1000,
             rttvar: 1000,
             rto: 1000,
-            deliv_rate: 100.0,
-            last_deliv_time: Instant::now(),
             existing: false,
-            dels_since_last: 0,
         }
     }
 }
@@ -168,10 +153,6 @@ impl RttCalculator {
         //     self.dels_since_last = 0;
         //     dbg!(self.deliv_rate);
         // }
-    }
-
-    fn bdp(&self) -> f64 {
-        self.deliv_rate * (self.srtt as f64) / 1000.0
     }
 
     fn rto(&self) -> Duration {
