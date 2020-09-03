@@ -29,6 +29,7 @@ pub struct SessionConfig {
 pub struct Session {
     send_tosend: Sender<Bytes>,
     recv_input: Receiver<Bytes>,
+    get_stats: Sender<Sender<SessionStats>>,
     _dropper: Vec<Box<dyn FnOnce() + Send + Sync + 'static>>,
     _task: smol::Task<()>,
 }
@@ -38,10 +39,12 @@ impl Session {
     pub fn new(cfg: SessionConfig) -> Self {
         let (s2, r2) = async_channel::bounded(1000);
         let (s4, r4) = async_channel::bounded(1000);
-        let task = runtime::spawn(session_loop(cfg, r2, s4));
+        let (s, r) = async_channel::unbounded();
+        let task = runtime::spawn(session_loop(cfg, r2, s4, r));
         Session {
             send_tosend: s2,
             recv_input: r4,
+            get_stats: s,
             _dropper: Vec::new(),
             _task: task,
         }
@@ -62,9 +65,27 @@ impl Session {
     pub async fn recv_bytes(&self) -> Bytes {
         self.recv_input.recv().await.unwrap()
     }
+
+    /// Obtains current statistics.
+    pub async fn get_stats(&self) -> SessionStats {
+        let (send, recv) = async_channel::bounded(1);
+        self.get_stats.send(send).await.unwrap();
+        recv.recv().await.unwrap()
+    }
 }
 
-async fn session_loop(cfg: SessionConfig, recv_tosend: Receiver<Bytes>, send_input: Sender<Bytes>) {
+/// Statistics of a single Sosistab session.
+pub struct SessionStats {
+    pub down_total: u64,
+    pub down_loss: f64,
+}
+
+async fn session_loop(
+    cfg: SessionConfig,
+    recv_tosend: Receiver<Bytes>,
+    send_input: Sender<Bytes>,
+    recv_statreq: Receiver<Sender<SessionStats>>,
+) {
     let measured_loss = AtomicU8::new(0);
     let high_recv_frame_no = AtomicU64::new(0);
     let total_recv_frames = AtomicU64::new(0);
@@ -151,7 +172,22 @@ async fn session_loop(cfg: SessionConfig, recv_tosend: Receiver<Bytes>, send_inp
             }
         }
     };
-    smol::future::race(send_loop, recv_loop).await;
+    // stats loop
+    let stats_loop = async {
+        loop {
+            let req = infal(recv_statreq.recv()).await;
+            let response = SessionStats {
+                down_total: high_recv_frame_no.load(Ordering::Relaxed),
+                down_loss: 1.0
+                    - total_recv_frames.load(Ordering::Relaxed) as f64
+                        / high_recv_frame_no.load(Ordering::Relaxed) as f64,
+            };
+            infal(req.send(response)).await;
+        }
+    };
+    smol::future::race(send_loop, recv_loop)
+        .or(stats_loop)
+        .await;
 }
 
 /// A reordering-resistant FEC reconstructor
@@ -266,51 +302,3 @@ impl LossCalculator {
         // self.median = (1.0 - total_seqno as f64 / top_seqno as f64).max(0.0);
     }
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use rand::prelude::*;
-//     use std::sync::Arc;
-//     #[test]
-//     fn session_trivial() {
-//         drop(env_logger::try_init());
-//         smol::run(async {
-//             let (send, recv) = async_channel::unbounded();
-//             let sess_config = SessionConfig {
-//                 latency: Duration::from_millis(10),
-//                 target_loss: 0.05,
-//                 output: Box::new(move |df| drop(send.try_send(df))),
-//             };
-//             let session = Session::new(sess_config);
-//             let f1 = async {
-//                 for _ in 0..1000 {
-//                     let mut bts = vec![0u8; 1280];
-//                     rand::thread_rng().fill_bytes(&mut bts);
-//                     let bts = Bytes::from(bts);
-//                     session.send_bytes(bts);
-//                     smol::Timer::new(Duration::from_millis(2)).await;
-//                 }
-//             };
-//             let f2 = async {
-//                 let mut ctr = 0;
-//                 loop {
-//                     let next_output = recv.recv().await.unwrap();
-//                     if rand::thread_rng().gen::<f64>() < 0.5 {
-//                         continue;
-//                     }
-//                     session.process_input(next_output);
-//                     loop {
-//                         if let Ok(la) = session.recv_input.try_recv() {
-//                             ctr += 1;
-//                             dbg!(ctr);
-//                         } else {
-//                             break;
-//                         }
-//                     }
-//                 }
-//             };
-//             smol::future::race(f1, f2).await;
-//         });
-//     }
-// }

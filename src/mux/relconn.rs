@@ -78,6 +78,7 @@ pub(crate) enum RelConnState {
     SynSent {
         stream_id: u16,
         tries: usize,
+        result: Sender<()>,
     },
     SteadyState {
         stream_id: u16,
@@ -128,7 +129,11 @@ async fn relconn_actor(
                     conn_vars: Box::new(ConnVars::default()),
                 }
             }
-            SynSent { stream_id, tries } => {
+            SynSent {
+                stream_id,
+                tries,
+                result,
+            } => {
                 let wait_interval = 2u64.saturating_pow(tries as u32);
                 log::trace!("C={} SynSent, tried {} times", stream_id, tries);
                 if wait_interval > MAX_WAIT_SECS {
@@ -166,6 +171,7 @@ async fn relconn_actor(
                     SynSent {
                         stream_id,
                         tries: tries + 1,
+                        result,
                     }
                 }
             }
@@ -414,7 +420,7 @@ impl ConnVars {
             .min(0.1);
         self.last_cubic = now;
         self.cubic_secs += delta_t;
-        let t = self.cubic_secs;
+        let t = self.cubic_secs * 2.0;
         let k = (self.cwnd_max / 2.0).powf(0.333);
         let wt = 0.4 * (t - k).powf(3.0) + self.cwnd_max;
         let new_cwnd = wt.min(10000.0);

@@ -87,7 +87,7 @@ async fn init_session(
     shared_sec: blake3::Hash,
     remote_addr: SocketAddr,
 ) -> std::io::Result<Session> {
-    const SHARDS: u8 = 8;
+    const SHARDS: u8 = 4;
 
     let (send_frame_out, recv_frame_out) = async_channel::bounded::<msg::DataFrame>(100);
     let (send_frame_in, recv_frame_in) = async_channel::bounded::<msg::DataFrame>(100);
@@ -170,7 +170,7 @@ async fn client_backhaul_once(
             }
             Some(Evt::Outgoing(bts)) => {
                 let now = Instant::now();
-                if now.saturating_duration_since(last_resume).as_millis() > 2000 || !refreshed {
+                if now.saturating_duration_since(last_resume).as_millis() > 1500 || !refreshed {
                     refreshed = true;
                     last_resume = Instant::now();
                     let g_encrypt = crypt::StdAEAD::new(&cookie.generate_c2s().next().unwrap());

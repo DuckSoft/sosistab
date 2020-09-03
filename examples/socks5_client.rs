@@ -6,9 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn main() {
-    // println!("TEST");
-    env_logger::builder().parse_filters("debug").init();
     // println!("YOH");
+    env_logger::init();
     smol::block_on(async {
         // let guard = pprof::ProfilerGuard::new(1000).unwrap();
         let args: Vec<String> = std::env::args().collect();
@@ -34,15 +33,33 @@ fn main() {
         )
         .await
         .unwrap();
-        println!("session established!");
-        let session = Arc::new(sosistab::mux::Multiplex::new(session));
+        eprintln!("session established to remote!");
+        let mplex = Arc::new(sosistab::mux::Multiplex::new(session));
+        {
+            let mplex = mplex.clone();
+            smol::spawn(async move {
+                loop {
+                    smol::Timer::after(Duration::from_secs(5)).await;
+                    let stats = mplex.get_session().get_stats().await;
+                    eprintln!(
+                        "STATS: total down {} packets; loss {:.3}%",
+                        stats.down_total,
+                        stats.down_loss * 100.0
+                    );
+                }
+            })
+            .detach()
+        }
         let client_listen = smol::Async::new(TcpListener::bind("localhost:3131").unwrap()).unwrap();
         loop {
             let (client, _) = client_listen.accept().await.unwrap();
             let client = async_dup::Arc::new(client);
-            let session = session.clone();
+            let mplex = mplex.clone();
             smol::spawn(async move {
-                let remote = session.open_conn().await.unwrap();
+                let start = Instant::now();
+                let remote = mplex.open_conn().await.unwrap();
+                let diff = Instant::now().saturating_duration_since(start);
+                eprintln!("opened connection in {} ms", diff.as_millis());
                 drop(
                     smol::future::race(
                         smol::io::copy(client.clone(), remote.to_async_writer()),

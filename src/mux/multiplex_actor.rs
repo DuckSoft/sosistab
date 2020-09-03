@@ -6,10 +6,10 @@ use mux::relconn::{RelConn, RelConnBack, RelConnState};
 use mux::structs::*;
 use rand::prelude::*;
 use smol::prelude::*;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 pub async fn multiplex(
-    session: Session,
+    session: Arc<Session>,
     urel_send_recv: Receiver<Bytes>,
     urel_recv_send: Sender<Bytes>,
     conn_open_recv: Receiver<Sender<RelConn>>,
@@ -122,14 +122,20 @@ pub async fn multiplex(
                 let stream_id = conn_tab
                     .find_id()
                     .ok_or_else(|| anyhow::anyhow!("ran out of connection ids"))?;
+                let (send_sig, recv_sig) = async_channel::bounded(1);
                 let (conn, conn_back) = RelConn::new(
                     RelConnState::SynSent {
                         stream_id,
                         tries: 0,
+                        result: send_sig,
                     },
                     glob_send.clone(),
                 );
-                drop(result_chan.send(conn).await);
+                runtime::spawn(async move {
+                    let _ = recv_sig.recv().await;
+                    drop(result_chan.send(conn).await)
+                })
+                .detach();
                 conn_tab.set_stream(stream_id, conn_back);
                 stream_id
             };
