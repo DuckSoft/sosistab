@@ -303,14 +303,13 @@ async fn relconn_actor(
                             conn_vars,
                         }
                     }
-                    Err(err) => {
-                        log::trace!("forced to RESET due to {}", err);
+                    err => {
+                        log::trace!("forced to RESET due to {:?}", err);
                         Reset {
                             stream_id,
                             death: smol::Timer::after(Duration::from_secs(MAX_WAIT_SECS)),
                         }
                     }
-                    bad => panic!("impossible state {:?}", bad),
                 }
             }
             Reset {
@@ -395,20 +394,20 @@ impl Default for ConnVars {
 
 impl ConnVars {
     fn congestion_ack(&mut self) {
-        self.cubic_update(Instant::now());
-        // self.cwnd += 4.0 / self.cwnd;
+        // self.cubic_update(Instant::now());
+        self.cwnd += 4.0 / self.cwnd;
         // eprintln!("ACK CWND => {}", self.cwnd);
     }
 
     fn congestion_rto(&mut self) {
         if Instant::now().saturating_duration_since(self.last_loss) > self.inflight.rto() * 2 {
-            self.cwnd_max = self.cwnd;
-            let now = Instant::now();
-            self.last_loss = now;
-            self.cubic_secs = 0.0;
-            self.cubic_update(now);
-            // self.last_loss = Instant::now();
-            // self.cwnd *= 0.8;
+            // self.cwnd_max = self.cwnd;
+            // let now = Instant::now();
+            // self.last_loss = now;
+            // self.cubic_secs = 0.0;
+            // self.cubic_update(now);
+            self.last_loss = Instant::now();
+            self.cwnd *= 0.5;
             // eprintln!("LOSS CWND => {}", self.cwnd);
         }
     }
@@ -420,7 +419,7 @@ impl ConnVars {
             .min(0.1);
         self.last_cubic = now;
         self.cubic_secs += delta_t;
-        let t = self.cubic_secs * 2.0;
+        let t = self.cubic_secs;
         let k = (self.cwnd_max / 2.0).powf(0.333);
         let wt = 0.4 * (t - k).powf(3.0) + self.cwnd_max;
         let new_cwnd = wt.min(10000.0);

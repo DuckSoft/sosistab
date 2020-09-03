@@ -2,6 +2,7 @@ use crate::fec::{FrameDecoder, FrameEncoder};
 use crate::msg::DataFrame;
 use crate::runtime;
 use async_channel::{Receiver, Sender};
+use async_lock::Lock;
 use bytes::Bytes;
 use smol::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -78,6 +79,8 @@ impl Session {
 pub struct SessionStats {
     pub down_total: u64,
     pub down_loss: f64,
+    pub down_recovered_loss: f64,
+    pub avg_run_len: u64,
 }
 
 async fn session_loop(
@@ -145,10 +148,10 @@ async fn session_loop(
             run_no += 1;
         }
     };
+    let mut decoder = Lock::new(RunDecoder::default());
     // receive loop
     let recv_loop = async {
         let mut rp_filter = ReplayFilter::new(0);
-        let mut decoder = RunDecoder::default();
         let mut loss_calc = LossCalculator::new();
         loop {
             let new_frame = infal(cfg.recv_frame.recv()).await;
@@ -164,7 +167,10 @@ async fn session_loop(
             high_recv_frame_no.fetch_max(new_frame.frame_no, Ordering::Relaxed);
             total_recv_frames.fetch_add(1, Ordering::Relaxed);
             if let Some(output) =
-                decoder.input(new_frame.run_no, new_frame.run_len, &new_frame.body)
+                decoder
+                    .lock()
+                    .await
+                    .input(new_frame.run_no, new_frame.run_len, &new_frame.body)
             {
                 for item in output {
                     let _ = send_input.try_send(item);
@@ -176,11 +182,16 @@ async fn session_loop(
     let stats_loop = async {
         loop {
             let req = infal(recv_statreq.recv()).await;
+            let decoder = decoder.lock().await;
             let response = SessionStats {
                 down_total: high_recv_frame_no.load(Ordering::Relaxed),
                 down_loss: 1.0
-                    - total_recv_frames.load(Ordering::Relaxed) as f64
-                        / high_recv_frame_no.load(Ordering::Relaxed) as f64,
+                    - (total_recv_frames.load(Ordering::Relaxed) as f64
+                        / high_recv_frame_no.load(Ordering::Relaxed) as f64)
+                        .min(1.0),
+                down_recovered_loss: 1.0
+                    - (decoder.correct_count as f64 / decoder.total_count as f64).min(1.0),
+                avg_run_len: decoder.ema_run_len,
             };
             infal(req.send(response)).await;
         }
@@ -196,16 +207,29 @@ struct RunDecoder {
     top_run: u64,
     bottom_run: u64,
     decoders: HashMap<u64, FrameDecoder>,
+    correct: HashSet<u64>,
+    total_count: u64,
+    correct_count: u64,
+
+    ema_run_len: u64,
 }
 
 impl RunDecoder {
     fn input(&mut self, run_no: u64, total_len: u32, bts: &[u8]) -> Option<Vec<Bytes>> {
+        self.ema_run_len = self.ema_run_len as u64 * 255 / 256 + total_len as u64 / 256;
+        if self.correct.get(&run_no).is_some() {
+            return None;
+        }
         if run_no >= self.bottom_run {
             if run_no > self.top_run {
                 self.top_run = run_no;
                 // advance bottom
                 while self.top_run - self.bottom_run > 100 {
+                    self.total_count += 1;
                     self.decoders.remove(&self.bottom_run);
+                    if self.correct.remove(&self.bottom_run) {
+                        self.correct_count += 1;
+                    }
                     self.bottom_run += 1;
                 }
             }
@@ -213,7 +237,12 @@ impl RunDecoder {
                 .decoders
                 .entry(run_no)
                 .or_insert_with(|| FrameDecoder::new(run_no, total_len));
-            decoder.decode(bts)
+            if let Some(res) = decoder.decode(bts) {
+                self.correct.insert(run_no);
+                Some(res)
+            } else {
+                None
+            }
         } else {
             None
         }

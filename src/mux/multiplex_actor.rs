@@ -15,7 +15,8 @@ pub async fn multiplex(
     conn_open_recv: Receiver<Sender<RelConn>>,
     conn_accept_send: Sender<RelConn>,
 ) -> anyhow::Result<()> {
-    let conn_tab = RwLock::new(ConnTable::default());
+    let _exit = scopeguard::guard((), |_| log::warn!("multiplex context exited!"));
+    let conn_tab = Arc::new(RwLock::new(ConnTable::default()));
     let (glob_send, glob_recv) = async_channel::bounded(10000);
     loop {
         // fires on receiving messages
@@ -117,39 +118,46 @@ pub async fn multiplex(
         // fires on a new stream open request
         let conn_open_evt = async {
             let result_chan = conn_open_recv.recv().await?;
-            let stream_id = {
-                let mut conn_tab = conn_tab.write().await;
-                let stream_id = conn_tab
-                    .find_id()
-                    .ok_or_else(|| anyhow::anyhow!("ran out of connection ids"))?;
-                let (send_sig, recv_sig) = async_channel::bounded(1);
-                let (conn, conn_back) = RelConn::new(
-                    RelConnState::SynSent {
-                        stream_id,
-                        tries: 0,
-                        result: send_sig,
-                    },
-                    glob_send.clone(),
+            let conn_tab = conn_tab.clone();
+            let glob_send = glob_send.clone();
+            runtime::spawn(async move {
+                let stream_id = {
+                    let mut conn_tab = conn_tab.write().await;
+                    let stream_id = conn_tab.find_id();
+                    if let Some(stream_id) = stream_id {
+                        let (send_sig, recv_sig) = async_channel::bounded(1);
+                        let (conn, conn_back) = RelConn::new(
+                            RelConnState::SynSent {
+                                stream_id,
+                                tries: 0,
+                                result: send_sig,
+                            },
+                            glob_send.clone(),
+                        );
+                        runtime::spawn(async move {
+                            let _ = recv_sig.recv().await;
+                            drop(result_chan.send(conn).await)
+                        })
+                        .detach();
+                        conn_tab.set_stream(stream_id, conn_back);
+                        stream_id
+                    } else {
+                        return;
+                    }
+                };
+                log::trace!("conn open send {}", stream_id);
+                drop(
+                    glob_send
+                        .send(Message::Rel {
+                            kind: RelKind::Syn,
+                            stream_id,
+                            seqno: 0,
+                            payload: Bytes::new(),
+                        })
+                        .await,
                 );
-                runtime::spawn(async move {
-                    let _ = recv_sig.recv().await;
-                    drop(result_chan.send(conn).await)
-                })
-                .detach();
-                conn_tab.set_stream(stream_id, conn_back);
-                stream_id
-            };
-            log::trace!("conn open send {}", stream_id);
-            drop(
-                glob_send
-                    .send(Message::Rel {
-                        kind: RelKind::Syn,
-                        stream_id,
-                        seqno: 0,
-                        payload: Bytes::new(),
-                    })
-                    .await,
-            );
+            })
+            .await;
             Ok::<(), anyhow::Error>(())
         };
         // await on them all
@@ -180,6 +188,7 @@ impl ConnTable {
 
     fn find_id(&mut self) -> Option<u16> {
         if self.sid_to_stream.len() >= 65535 {
+            log::warn!("ran out of descriptors ({})", self.sid_to_stream.len());
             return None;
         }
         loop {

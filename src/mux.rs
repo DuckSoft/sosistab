@@ -1,7 +1,7 @@
 use crate::*;
 use async_channel::{Receiver, Sender};
 use bytes::Bytes;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 mod multiplex_actor;
 mod relconn;
 mod structs;
@@ -19,7 +19,7 @@ pub struct Multiplex {
 }
 
 fn to_ioerror<T: Into<Box<dyn std::error::Error + Send + Sync>>>(val: T) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::ConnectionAborted, val)
+    std::io::Error::new(std::io::ErrorKind::ConnectionReset, val)
 }
 
 impl Multiplex {
@@ -70,9 +70,14 @@ impl Multiplex {
 
     /// Open a reliable conn to the other end.
     pub async fn open_conn(&self) -> std::io::Result<RelConn> {
-        let (send, recv) = async_channel::unbounded();
-        self.conn_open.send(send).await.map_err(to_ioerror)?;
-        recv.recv().await.map_err(to_ioerror)
+        loop {
+            let (send, recv) = async_channel::unbounded();
+            self.conn_open.send(send).await.map_err(to_ioerror)?;
+            if let Ok(rc) = recv.recv().await {
+                break Ok(rc);
+            }
+            smol::Timer::after(Duration::from_secs(1)).await;
+        }
     }
 
     /// Accept a reliable conn from the other end.

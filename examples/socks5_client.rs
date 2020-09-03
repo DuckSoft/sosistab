@@ -42,9 +42,11 @@ fn main() {
                     smol::Timer::after(Duration::from_secs(5)).await;
                     let stats = mplex.get_session().get_stats().await;
                     eprintln!(
-                        "STATS: total down {} packets; loss {:.3}%",
+                        "STATS: total down {} packets; raw loss {:.3}%; processed loss {:.3}%; avg rx size {} B",
                         stats.down_total,
-                        stats.down_loss * 100.0
+                        stats.down_loss * 100.0,
+                        stats.down_recovered_loss * 100.0,
+                        stats.avg_run_len,
                     );
                 }
             })
